@@ -9,15 +9,15 @@
 
       <default class="joint_1">
         <joint range="-0.785398 0.785398" frictionloss="0.3" />
-        <position forcerange="-60 60" />
+        <position forcerange="-100 100" />
       </default>
       <default class="joint_2">
         <joint range="-1.919862 3.490659" frictionloss="0.3" />
-        <position forcerange="-60 60" />
+        <position forcerange="-100 100" />
       </default>
       <default class="joint_3">
         <joint range="-2.670354 -0.698132" frictionloss="0.3" />
-        <position forcerange="-60 60" />
+        <position forcerange="-100 100" />
       </default>
       <default class="joint_4">
         <joint range="-999999 999999" frictionloss="0.3" />
