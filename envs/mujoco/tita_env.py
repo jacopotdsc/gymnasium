@@ -20,6 +20,8 @@ except ImportError:
     )
 
 '''
+TODO: check frequency of data readings )
+
 Observation vector: ( take a sequence of observation ?)
 - Linear velocity in body frame (x, y, z )
 - angular velocity in body frame ( Gyroscope readings )
@@ -40,7 +42,7 @@ base robotic reward:
 - linear velocity penalty
 - angular velocity penalty
 - joint motion: acc è vel
-- joint torquest
+- joint torques
 - action rate
 - collision
 - feet air time
@@ -115,24 +117,23 @@ def default_config() -> config_dict.ConfigDict:
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              # tracking
-              tracking_lin_vel=1.0, 
-              tracking_ang_vel=1.0, 
-              # base
+              # Standard robotic-specific shaping reward
+              tracking_lin_vel=0.0, 
+              tracking_ang_vel=0.0, 
               lin_vel_z=0.0,
               ang_vel_xy=0.0,
-              orientation=1.0,
-              base_height=0.0, # work with base_height_target
-              # Other.
-              dof_pos_limits=-1.0,
-              pose=0.0,
-              # Other.
-              termination=-1.0,
-              stand_still=-0.0,
-              # Regularization.
+              joint_motion= 0.0,
               torques=-0.00005,
               action_rate=-0.001, 
+
+              # Other rewards
+              base_height=0.0, # work with base_height_target
+              orientation=1.0,
+              termination=-10.0,
               energy=-0.0001,
+              collision=0.0,
+              dof_pos_limits=-1.0,
+                
               # Feet.
               #feet_clearance=-2.0,
               #feet_height=-0.2,
@@ -667,6 +668,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"stand_still": _cost_stand_still(self, info["command"], data.qpos[7:]),
             
             "energy": _cost_energy(self, data.qvel[6:], data.qacc[6:]),
+            "collision": _cost_collision(self, data),
             #"feet_slip": self._cost_feet_slip(data, contact, info),
             #"feet_clearance": self._cost_feet_clearance(data),
             #"feet_height": self._cost_feet_height(
