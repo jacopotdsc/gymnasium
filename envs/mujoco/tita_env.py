@@ -3,6 +3,10 @@
 #
 # MuJoCo Tita Wheel-Legged Robot Environment for Gymnasium
 
+import sys
+import time
+sys.path.insert(0, '/home/ubuntu/Desktop/repo_rl/TITA_MJ/compiled')
+
 import numpy as np
 from typing import Any, Dict, Optional
 import gymnasium as gym
@@ -10,6 +14,7 @@ from gymnasium import utils
 from gymnasium.envs.mujoco import MujocoEnv
 from gymnasium.spaces import Box
 from ml_collections import config_dict
+import wm
 
 try:
     import mujoco
@@ -21,6 +26,18 @@ except ImportError:
 
 '''
 TODO: check frequency of data readings )
+TODO: randomization doesn't work cause of Controller
+TODO: set right frequency: 
+        sim_dt * frame_skip = ctrl_dt
+        1 / ctrl_dt = Controller frequency 
+
+    - sim_dt how much time passes in sim for each mujoco step
+    - frame_skip: how many mujoco steps per env step
+    - sim_dt * frame_skip correspond to how much time
+        passed for one call of step()
+    - the frequency of call of the controller is 1/(sim_dt * frame_skip)
+
+
 
 Observation vector: ( take a sequence of observation ?)
 - Linear velocity in body frame (x, y, z )
@@ -92,8 +109,9 @@ def default_consts() -> config_dict.ConfigDict:
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.02,
-      sim_dt=0.004,
+      #ctrl_dt=0.02,
+      #sim_dt=0.004,
+      use_controller = True,
       frame_skip=5,
       observation_state_only=True, # True only for sac
       episode_length=1000,
@@ -127,7 +145,7 @@ def default_config() -> config_dict.ConfigDict:
               action_rate=-0.001, 
 
               # Other rewards
-              base_height=0.0, # work with base_height_target
+              base_height=1.0, # work with base_height_target
               orientation=1.0,
               termination=-10.0,
               energy=-0.0001,
@@ -152,8 +170,8 @@ def default_config() -> config_dict.ConfigDict:
       ),
       # Command on cartesian space velocities: vx, vy, wz
       command_config=config_dict.create( 
-          a=[1.5, 0.8, 1.2],  # Uniform distribution for command amplitude.
-          b=[0.9, 0.25, 0.5], # Probability of not zeroing out new command.
+          a=[1.5, 0.8, 0.0],  # Uniform distribution for command amplitude.
+          b=[0.9, 0.25, 0.0], # Probability of not zeroing out new command.
       ),
   )
 
@@ -173,7 +191,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     def __init__(
         self,
-        xml_file: str = "tita_mjx.xml",
+        xml_file: str = "None",
         default_camera_config: Dict[str, float] = DEFAULT_CAMERA_CONFIG,
         config: Optional[config_dict.ConfigDict] = default_config(),
         consts: Optional[config_dict.ConfigDict] = default_consts(),
@@ -213,7 +231,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             **kwargs,
         )
         
+        self.n_frame = 0
+        self.frame_threshold = 10 # number of frames to wait before enabling controller
         self._post_init()
+        #print(self.model.opt.timestep ) # 0.002
+        #self.model.opt.timestep = self._config.sim_dt
+
+        self.reset_model()
 
     # ------- Sensor readings. -------
 
@@ -261,13 +285,42 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             for sensor_name in self._consts.FEET_POS_SENSOR
         ])
 
+    def compute_tita_controller_torque(self, data: mujoco.MjData) -> wm.RobotState:
+        robot_state = wm.robot_state_from_mujoco(self.model, data)
+        torque = self._walking_manager.update(robot_state)
 
+        torque_sorted = []
+        for joint_name in self._actuated_joint_names:
+            val = torque[joint_name]
+            print(f"{joint_name}: {val:.3f}"    )
+            torque_sorted.append(val)
+        print("----------")
+        return torque_sorted
+    
     # ------- Environment methods. -------
+
+    def _tita_controller_init(self) -> None:
+        robot_state = wm.robot_state_from_mujoco(self.model, self.data)
+        armatures = {}
+        for i in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            dof_adr = self.model.jnt_dofadr[i]
+            if name and dof_adr >= 0:
+                val = self.model.dof_armature[dof_adr]
+            armatures[name] = val
+
+        self._walking_manager = wm.WalkingManager()
+        self._walking_manager.init(robot_state, armatures)
 
     def _post_init(self) -> None:
         self._init_qpos = np.array(self.model.keyframe("home").qpos.copy())
         self._default_pose = np.array(self.model.keyframe("home").qpos[7:].copy())
 
+        self._actuated_joint_names = [
+            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, self.model.actuator_trnid[i, 0])
+            for i in range(self.model.nu)
+        ]
+        
         # Setup Indices and IDs
         self._torso_body_id = self.model.body(self._consts.ROOT_BODY).id
         self._torso_mass = self.model.body_subtreemass[self._torso_body_id]
@@ -338,8 +391,12 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "pert_mag": None, #pert_mag,
         }
 
+        if self._config.use_controller:
+            self._tita_controller_init()
+
     def reset_model(self):
         """Reset the environment model."""
+        self.n_frame = 0
         noise_low = -self._reset_noise_scale
         noise_high = self._reset_noise_scale
         
@@ -347,15 +404,15 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         qvel = np.zeros(self.model.nv)
         
         # Base position randomization
-        qpos[0:2] += self.np_random.uniform(low=noise_low, high=noise_high, size=2)
+        #qpos[0:2] += self.np_random.uniform(low=noise_low, high=noise_high, size=2)
         
         # Base orientation randomization
         yaw = self.np_random.uniform(-np.pi, np.pi)
         quat_yaw = np.array([np.cos(yaw/2), 0, 0, np.sin(yaw/2)])
-        qpos[3:7] = self._quat_mul(qpos[3:7], quat_yaw)
+        #qpos[3:7] = self._quat_mul(qpos[3:7], quat_yaw)
         
         # Velocity randomization
-        qvel[0:6] = self._reset_noise_scale * self.np_random.standard_normal(6)
+        #qvel[0:6] = self._reset_noise_scale * self.np_random.standard_normal(6)
         
         self.set_state(qpos, qvel)
         
@@ -380,14 +437,21 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "pert_dir": np.zeros(3),
             "pert_mag": None, #pert_mag,
         }
-        
+
+        if self._config.use_controller:
+            self._tita_controller_init()
+
         return self._get_obs()
 
     def step(self, action):
         """Execute one step of the environment."""
-
-        # Set motor targets
-        motor_targets = self._default_pose + action * self.action_scale
+        self.n_frame += 1
+        if self._config.use_controller:
+            tita_controller_torque = self.compute_tita_controller_torque(self.data) if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
+            motor_targets = tita_controller_torque + action * self.action_scale
+        else:
+            print("using nn action")
+            motor_targets = action * self.action_scale
         
         self.do_simulation(motor_targets, self._config.frame_skip)
         
@@ -395,7 +459,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         reward, reward_info = self._get_rew(action, self.data, self.info)
         terminated = self._is_terminated()
         info = {
-            "base_height": self.data.qpos[2],
             **reward_info,
         }
         
@@ -702,8 +765,8 @@ def make_tita_env(
 
 
 # Register the environment
-gym.register(
-    id="Tita-v0",
-    entry_point="gymnasium.envs.mujoco:TitaEnv",
-    max_episode_steps=1000,
-)
+#gym.register(
+#    id="Tita-v0",
+#    entry_point="gymnasium.envs.mujoco:TitaEnv",
+#    max_episode_steps=1000,
+#)
