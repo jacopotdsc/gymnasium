@@ -306,6 +306,23 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             
         return np.array(torque_sorted)
     
+    def _quat_mul(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Multiplies two quaternions.
+
+        Args:
+            u: (4,) quaternion (w,x,y,z)
+            v: (4,) quaternion (w,x,y,z)
+
+        Returns:
+            A quaternion u * v.
+        """
+        return np.array([
+            u[0] * v[0] - u[1] * v[1] - u[2] * v[2] - u[3] * v[3],
+            u[0] * v[1] + u[1] * v[0] + u[2] * v[3] - u[3] * v[2],
+            u[0] * v[2] - u[1] * v[3] + u[2] * v[0] + u[3] * v[1],
+            u[0] * v[3] + u[1] * v[2] - u[2] * v[1] + u[3] * v[0],
+        ])
+
     # =========== Environment methods ===========
 
     def _tita_controller_init(self) -> None:
@@ -409,6 +426,26 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         self._tita_controller_init()
 
+    def randomize(self):
+
+        d_pose = self.np_random.uniform(low=-0.1, high=0.1, size=2)
+
+        deg_10 = (np.pi / 180)*10
+        roll = self.np_random.uniform(-deg_10, deg_10)
+        pitch = self.np_random.uniform(-deg_10, deg_10)
+        yaw = self.np_random.uniform(-deg_10, deg_10)
+
+        quat_roll  = np.array([ np.cos(roll/2),  np.sin(roll/2), 0, 0])
+        quat_pitch = np.array([ np.cos(pitch/2), 0,   np.sin(pitch/2), 0])
+        quat_yaw   = np.array([ np.cos(yaw/2),   0, 0, np.sin(yaw/2)])
+
+        d_orientation = self._quat_mul( self._quat_mul(quat_yaw, quat_pitch), quat_roll )
+        d_vel = np.random.uniform(low=-0.1, high=0.1) * self.np_random.standard_normal(6)
+
+        floor_friction = np.random.uniform(low=-0.15, high=0.15, size=3)
+
+        #return d_pose, d_orientation, d_vel
+    
     def reset_model(self):
         """Reset the environment model."""
         self.n_frame = 0
@@ -417,17 +454,28 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         
         qpos = self._init_qpos.copy()
         qvel = np.zeros(self.model.nv)
-        
+
         # Base position randomization
-        #qpos[0:2] += self.np_random.uniform(low=noise_low, high=noise_high, size=2)
+        qpos[0:2] += self.np_random.uniform(low=noise_low, high=noise_high, size=2)
         
         # Base orientation randomization
-        yaw = self.np_random.uniform(-np.pi, np.pi)
-        quat_yaw = np.array([np.cos(yaw/2), 0, 0, np.sin(yaw/2)])
+        #yaw = self.np_random.uniform(-np.pi/12, np.pi/12)
+        #quat_yaw = np.array([np.cos(yaw/2), 0, 0, np.sin(yaw/2)])
         #qpos[3:7] = self._quat_mul(qpos[3:7], quat_yaw)
+
+        deg_rnd = (np.pi / 180)*5
+        roll = self.np_random.uniform(-deg_rnd, deg_rnd)
+        pitch = self.np_random.uniform(-deg_rnd, deg_rnd)
+        yaw = self.np_random.uniform(-deg_rnd*2, deg_rnd*2)
+        quat_roll  = np.array([ np.cos(roll/2),  np.sin(roll/2), 0, 0])
+        quat_pitch = np.array([ np.cos(pitch/2), 0,   np.sin(pitch/2), 0])
+        quat_yaw   = np.array([ np.cos(yaw/2),   0, 0, np.sin(yaw/2)])
+        q_noise = self._quat_mul( self._quat_mul(quat_yaw, quat_pitch), quat_roll )
+
+        qpos[3:7] = self._quat_mul(qpos[3:7], q_noise)
         
         # Velocity randomization
-        #qvel[0:6] = self._reset_noise_scale * self.np_random.standard_normal(6)
+        qvel[0:6] = self._reset_noise_scale * self.np_random.standard_normal(6)
         
         self.set_state(qpos, qvel)
         mujoco.mj_forward(self.model, self.data) 
@@ -515,23 +563,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         
         self.n_frame += 1
         return observation, reward, terminated, False, info_reward
-
-    def _quat_mul(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """Multiplies two quaternions.
-
-        Args:
-            u: (4,) quaternion (w,x,y,z)
-            v: (4,) quaternion (w,x,y,z)
-
-        Returns:
-            A quaternion u * v.
-        """
-        return np.array([
-            u[0] * v[0] - u[1] * v[1] - u[2] * v[2] - u[3] * v[3],
-            u[0] * v[1] + u[1] * v[0] + u[2] * v[3] - u[3] * v[2],
-            u[0] * v[2] - u[1] * v[3] + u[2] * v[0] + u[3] * v[1],
-            u[0] * v[3] + u[1] * v[2] - u[2] * v[1] + u[3] * v[0],
-        ])
 
     def _get_obs(self, info: dict[str, Any],) -> np.ndarray:
         """Get the current observation."""
