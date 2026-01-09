@@ -17,6 +17,7 @@ from gymnasium.spaces import Box
 from ml_collections import config_dict
 from collections import deque
 import wm
+import copy
 
 try:
     import mujoco
@@ -39,32 +40,70 @@ TODO: set right frequency:
         passed for one call of step()
     - the frequency of call of the controller is 1/(sim_dt * frame_skip)
 
+ Robot State:
+    - position, it explodd with values, how handle it
+    - orientation, quaternion
+    - Linear velocity in body frame (x, y, z )
+    - angular velocity in body frame ( Gyroscope readings )
+    - Joint State
+        - Joint positions
+        - Joint velocities
+        - joint torques 
+    - Total force
+    - contact points
+    - Contact forces
+
+Desired configuration
+    - position
+    - orientation
+    - Linear velocity
+    - angular velocity
+    - Joint positions
+    - Joint velocities
+    - joint acceleration
+    - com: position, velocity, acceleration
+    - l_wheel and r_wheel: 
+        SE3 pose ( position + orientation of the wheel )
+        linear velocity
+        angular velocity
+        linear acceleration
+        angular acceleration
+    - base link:
+        position
+        angular velocity
+        angular acceleration
+
+MPC I/O
+    - ddp_com
+    - gravity vector
+    - total force
+    - p_zmp - p_con
+
+    - p_com(t), v_com(t),a_com(t)
+    - p_zmp(t), v_zmp(t), a_zmp(t)
+
+WBC I/O
+    - robot_state
+    - desired_configuration
 
 
-Observation vector: ( take a sequence of observation ?)
-- Linear velocity in body frame (x, y, z )
-- angular velocity in body frame ( Gyroscope readings )
-- Joint angles
-- Joint velocities
-- joint accelerations ?
-- joint torques ?
+in get obs,
 
-- Desired CoM state
-- footstep placement ?
-- Last action taken from neural network
+Note: MPC_torque_k + NN_Action_k = motor_target_k
+        With k the timestamp
 
-- User command (vx, vy, omega)
+Idea: add delta( com - zmp)
 
-base robotic reward:
-- linear velocity tracking
-- angular velocity tracking
-- linear velocity penalty
-- angular velocity penalty
-- joint motion: acc è vel
-- joint torques
-- action rate
-- collision
-- feet air time
+Action Space: gaussian 0 mean, std 1.0 
+
+Rewards: should be the same optimized by MPC 
+         suggested by the paper: A Modular Residual Learning Framework to Enhance Model-Based Approach for Robust Locomotion
+
+    - alive
+    - tracking vx, vy, omega
+
+    - stand still
+
 '''
 
 
@@ -96,16 +135,17 @@ def default_consts() -> config_dict.ConfigDict:
                         
         ROOT_BODY = "base_link",
 
+        LOCAL_ANGVEL_SENSOR = "local_angvel",
+        LOCAL_LINVEL_SENSOR = "local_linvel",
+        LOCAL_LINACC_SENSOR = "local_linacc",
+
         UPVECTOR_SENSOR = "upvector",
+        FORWARD_VECTOR = "forward_vector",
+
         GLOBAL_LINVEL_SENSOR = "global_linvel",
         GLOBAL_ANGVEL_SENSOR = "global_angvel",
-        LOCAL_LINVEL_SENSOR = "local_linvel",
-        ACCELEROMETER_SENSOR = "accelerometer",
-        GYRO_SENSOR = "gyro",
 
-        TITA_NUM_FEET = 2,
         TITA_WHEEL_INDICES = np.array([3, 7]),
-        TITA_LEG_INDICES = np.array([0, 1, 2, 4, 5, 6]),
 
     )
 
@@ -116,11 +156,11 @@ def default_config() -> config_dict.ConfigDict:
       use_controller = True,
       frame_skip=1,
       observation_state_only=True, # True only for sac
+      randomize_on_reset=False,
       episode_length=1000,
-      deque_length=5,
+      frame_stack=1,
       action_repeat=1,
-      action_scale=20.0,
-      history_len=1,
+      action_scale=100.0,
       soft_joint_pos_limit_factor=0.95,
       min_height=0.33,
       max_height=0.49,
@@ -251,6 +291,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     # =========== Sensor readings ===========
 
+    def get_config(self) -> config_dict.ConfigDict:
+        return self._config
+
     def get_sensor_data(
         self, model: mujoco.MjModel, data: mujoco.MjData, sensor_name: str
     ) -> np.ndarray:
@@ -297,14 +340,16 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     def compute_tita_controller_torque(self, data: mujoco.MjData) -> np.ndarray:
         robot_state = wm.robot_state_from_mujoco(self.model, data)
-        torque = self._walking_manager.update(robot_state)
+        result_update = self._walking_manager.update(robot_state, np.array([0.0, 0.0, 0.40]))
+        torque = result_update.cmd
+        mpc_solution = result_update.solution
 
         torque_sorted = []
         for joint_name in self._actuated_joint_names:
             val = torque[joint_name]
             torque_sorted.append(val)
             
-        return np.array(torque_sorted)
+        return np.array(torque_sorted), mpc_solution
     
     def _quat_mul(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Multiplies two quaternions.
@@ -339,6 +384,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._walking_manager.init(robot_state, armatures)
 
     def _post_init(self) -> None:
+
+        self._init_model = copy.deepcopy(self.model)
         self._init_qpos = np.array(self.model.keyframe("home").qpos.copy())
         self._default_pose = np.array(self.model.keyframe("home").qpos[7:].copy())
 
@@ -388,21 +435,11 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._cmd_a = np.array(self._config.command_config.a)
         self._cmd_b = np.array(self._config.command_config.b)
 
-        # Observation space: 
-        #   (7) body pose
-        #   (3) linvel
-        #   (3) gyro   
-        #   (8) joint_angles
-        #   (8) joint_vel
-        #   (8) last_nn_act
-        #   (8) tita_controller_output
-        #   (8) last_motor_act
-        #   (3) command
-        obs_size =  7 + 3 + 3 + 8 + 8 + 8 + 3
+        obs_size =  49 #* self._config.frame_stack
         self.observation_space = Box( low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32 )
 
-        self.history_obs = deque(maxlen=self._config.deque_length )
-        self.history_act = deque(maxlen=self._config.deque_length )
+        self.history_obs = deque(maxlen=self._config.frame_stack )
+        self.history_act = deque(maxlen=self._config.frame_stack )
 
         # info used to be propagated
         self.info = {
@@ -411,104 +448,99 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "last_motor_act": np.zeros(self.model.nu),
             "last_last_nn_act": np.zeros(self.model.nu),
             "last_last_motor_act": np.zeros(self.model.nu),
-            #"steps_until_next_cmd": None, #steps_until_next_cmd,
-            #"feet_air_time": np.zeros(2),
-            #"last_contact": np.zeros(2, dtype=bool),
-            #"swing_peak": np.zeros(2),
-            #"steps_until_next_pert": None, #steps_until_next_pert,
-            #"pert_duration_seconds": None, #pert_duration_seconds,
-            #"pert_duration": None, #pert_duration_steps,
-            #"steps_since_last_pert": 0,
-            #"pert_steps": 0,
-            #"pert_dir": np.zeros(3),
-            #"pert_mag": None, #pert_mag,
+            "tita_controller_output" : np.zeros(self.model.nu),
+            "mpc_sol_com_pos": np.zeros(3),
+            "mpc_sol_com_vel": np.zeros(3),
+            "mpc_sol_com_acc": np.zeros(3),
+            "mpc_sol_pc_pos": np.zeros(3),
+            "mpc_sol_pc_vel": np.zeros(3),
+            "mpc_sol_pc_acc": np.zeros(3),
         }
 
+        self._init_info = copy.deepcopy(self.info.copy())
+
         self._tita_controller_init()
-
-    def randomize(self):
-
-        d_pose = self.np_random.uniform(low=-0.1, high=0.1, size=2)
-
-        deg_10 = (np.pi / 180)*10
-        roll = self.np_random.uniform(-deg_10, deg_10)
-        pitch = self.np_random.uniform(-deg_10, deg_10)
-        yaw = self.np_random.uniform(-deg_10, deg_10)
-
-        quat_roll  = np.array([ np.cos(roll/2),  np.sin(roll/2), 0, 0])
-        quat_pitch = np.array([ np.cos(pitch/2), 0,   np.sin(pitch/2), 0])
-        quat_yaw   = np.array([ np.cos(yaw/2),   0, 0, np.sin(yaw/2)])
-
-        d_orientation = self._quat_mul( self._quat_mul(quat_yaw, quat_pitch), quat_roll )
-        d_vel = np.random.uniform(low=-0.1, high=0.1) * self.np_random.standard_normal(6)
-
-        floor_friction = np.random.uniform(low=-0.15, high=0.15, size=3)
-
-        #return d_pose, d_orientation, d_vel
     
     def reset_model(self):
         """Reset the environment model."""
         self.n_frame = 0
-        noise_low = -self._reset_noise_scale
-        noise_high = self._reset_noise_scale
+        self.model = copy.deepcopy(self._init_model)
         
         qpos = self._init_qpos.copy()
         qvel = np.zeros(self.model.nv)
 
-        # Base position randomization
-        qpos[0:2] += self.np_random.uniform(low=noise_low, high=noise_high, size=2)
-        
-        # Base orientation randomization
-        #yaw = self.np_random.uniform(-np.pi/12, np.pi/12)
-        #quat_yaw = np.array([np.cos(yaw/2), 0, 0, np.sin(yaw/2)])
-        #qpos[3:7] = self._quat_mul(qpos[3:7], quat_yaw)
+        # ----- Apply randomization -----
+        if self._config.randomize_on_reset == True:
+            print("randomizing environment on reset...")
+            # State: base position randomization
+            state_base_noise = 0.01
+            qpos[0:2] += self.np_random.uniform(low=-state_base_noise, high=state_base_noise, size=2)
+            
+            # State :base orientation randomization
+            state_orientation_noise = (np.pi / 180)*15 # 15 degrees noise
+            roll = self.np_random.uniform(-state_orientation_noise, state_orientation_noise)
+            pitch = self.np_random.uniform(-state_orientation_noise, state_orientation_noise)
+            yaw = self.np_random.uniform(-state_orientation_noise*2, state_orientation_noise*2)
+            quat_roll  = np.array([ np.cos(roll/2),  np.sin(roll/2), 0, 0])
+            quat_pitch = np.array([ np.cos(pitch/2), 0,   np.sin(pitch/2), 0])
+            quat_yaw   = np.array([ np.cos(yaw/2),   0, 0, np.sin(yaw/2)])
+            q_noise = self._quat_mul( self._quat_mul(quat_yaw, quat_pitch), quat_roll )
 
-        deg_rnd = (np.pi / 180)*5
-        roll = self.np_random.uniform(-deg_rnd, deg_rnd)
-        pitch = self.np_random.uniform(-deg_rnd, deg_rnd)
-        yaw = self.np_random.uniform(-deg_rnd*2, deg_rnd*2)
-        quat_roll  = np.array([ np.cos(roll/2),  np.sin(roll/2), 0, 0])
-        quat_pitch = np.array([ np.cos(pitch/2), 0,   np.sin(pitch/2), 0])
-        quat_yaw   = np.array([ np.cos(yaw/2),   0, 0, np.sin(yaw/2)])
-        q_noise = self._quat_mul( self._quat_mul(quat_yaw, quat_pitch), quat_roll )
+            qpos[3:7] = self._quat_mul(qpos[3:7], q_noise)
+            
+            # State: velocity randomization
+            state_vel_noise = 0.01
+            qvel[0:6] = state_vel_noise * self.np_random.standard_normal(6) # mean 0, std 1
 
-        qpos[3:7] = self._quat_mul(qpos[3:7], q_noise)
+            # Center of mass randomization: +U(-0.05, 0.05)
+            d_com_offset = 0.05
+            d_com = np.random.uniform(low=-d_com_offset, high=d_com_offset, size=3)
+            #self.model.body_ipos[self._torso_body_id] += d_com
+
+            # Mass: torso mass randomization: +U(-1, 1)
+            d_torso_mass_offset = 1
+            d_torso_mass = np.random.uniform(low=-d_torso_mass_offset, high=d_torso_mass_offset)
+            self.model.body_mass[self._torso_body_id] += d_torso_mass
+
+            # Mass: link mass randomization: *U(-0.1, 0.1)
+            d_link_mass_percentage = 0.1
+            d_link_mass = np.random.uniform(low=-d_link_mass_percentage, high=d_link_mass_percentage, size=(self.model.nbody-1))
+            self.model.body_mass[1:] *= (1 + d_link_mass)
+
+            # Mass: armature randomization: +U(-0.05, 0.05)
+            d_armature_offset = 0.05
+            d_armature = np.random.uniform(low=-d_armature_offset, high=d_armature_offset, size=(self.model.nv-6))
+            #self.model.dof_armature[6:] += d_armature
+
+            # Joint: frictionloss randomization: +U(-0.1, 0.1)
+            d_frictionloss_offset = 0.1
+            d_frictionloss = np.random.uniform(low=-d_frictionloss_offset, high=d_frictionloss_offset, size=(self.model.nv - 6))
+            #self.model.dof_frictionloss[6:] *= (1 + d_frictionloss)
+
+            # Friction: floor friction randomization: +U(-0.15, 0.15)
+            d_floor_friction_offset = 0.15
+            d_floor_friction = np.random.uniform(low=-d_floor_friction_offset, high=d_floor_friction_offset, size=3)
+            #self.model.geom_friction[self._floor_geom_id, 0:3] *= (1 + d_floor_friction)
         
-        # Velocity randomization
-        qvel[0:6] = self._reset_noise_scale * self.np_random.standard_normal(6)
-        
+        # ----- Reset history -----
+        self.info = copy.deepcopy(self._init_info.copy())
+
         self.set_state(qpos, qvel)
-        mujoco.mj_forward(self.model, self.data) 
-        
-        self.info = {
-            "command": np.zeros(3),
-            "last_nn_act": np.zeros(self.model.nu),
-            "last_motor_act": np.zeros(self.model.nu),
-            "last_last_nn_act": np.zeros(self.model.nu),
-            "last_last_motor_act": np.zeros(self.model.nu),
-            "tita_controller_output" : np.zeros(self.model.nu),
-            #"steps_until_next_cmd": None, #steps_until_next_cmd,
-            #"feet_air_time": np.zeros(2),
-            #"last_contact": np.zeros(2, dtype=bool),
-            #"swing_peak": np.zeros(2),
-            #"steps_until_next_pert": None, #steps_until_next_pert,
-            #"pert_duration_seconds": None, #pert_duration_seconds,
-            #"pert_duration": None, #pert_duration_steps,
-            #"steps_since_last_pert": 0,
-            #"pert_steps": 0,
-            #"pert_dir": np.zeros(3),
-            #"pert_mag": None, #pert_mag,
-        }
+        mujoco.mj_forward(self.model, self.data)
 
         self._tita_controller_init()
 
-        return self._get_obs(self.info)
+        self.history_obs.clear()
+        self.history_act.clear()
+
+        ob = self._get_obs(self.info)
+        return ob
 
     def step(self, action):
         """Execute one step of the environment."""
-
+        #print(f"Step frame: {self.n_frame}")
         self.frame_threshold = 1
-        tita_controller_torque = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
+        tita_controller_torque, mpc_solution = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
         scaled_action = action*self._config.action_scale
         motor_targets = tita_controller_torque + scaled_action if self.n_frame >= self.frame_threshold else tita_controller_torque
         #time.sleep(2)
@@ -554,43 +586,52 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self.info["last_last_motor_act"] = self.info["last_motor_act"]
         self.info["last_nn_act"] = action
         self.info["last_motor_act"] = motor_targets
-
-        self.history_obs.append(observation)
-        self.history_act.append(action)
+        self.info["mpc_sol_com_pos"] = list(mpc_solution.com.pos)
+        self.info["mpc_sol_com_vel"] = list(mpc_solution.com.vel)
+        self.info["mpc_sol_com_acc"] = list(mpc_solution.com.acc)
+        self.info["mpc_sol_pc_pos"] = list(mpc_solution.pc.pos) if self.n_frame > 0 else np.zeros(3) # first values is broken, high values
+        self.info["mpc_sol_pc_vel"] = list(mpc_solution.pc.vel)
+        self.info["mpc_sol_pc_acc"] = list(mpc_solution.pc.acc)
 
         if self.render_mode == "human":
             self.render()
-        
+
         self.n_frame += 1
+
         return observation, reward, terminated, False, info_reward
 
     def _get_obs(self, info: dict[str, Any],) -> np.ndarray:
         """Get the current observation."""
         qpos = self.data.qpos.copy()
         qvel = self.data.qvel.copy()
-        
-        gyro = self.get_sensor_data(self.model, self.data, self._consts.GYRO_SENSOR)
-        linvel = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINVEL_SENSOR)
-        
+
         # Extract gravity from the IMU frame
         imu_xmat = self.data.site_xmat[self._imu_site_id].reshape(3, 3)
-        gravity_body = imu_xmat.T @ np.array([0, 0, 1])
-        
+
+        # Variable definition for readability
+        height = np.array(qpos[2]).reshape(1,)
+        orientation = qpos[3:7]
+        gravity_body_frame = imu_xmat.T @ np.array([0, 0, 1])
+        linvel = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINVEL_SENSOR)
+        linacc = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINACC_SENSOR)
         joint_angles = qpos[7:]
         joint_vel = qvel[6:]
-        
+        joint_torque_controller_normalized = info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1])
+        last_nn_act = info["last_nn_act"]
+        command = info["command"]
+    
         # Observation
         observation = np.concatenate([
-            qpos[0:3],
-            qpos[3:7], 
+            height,
+            orientation,
+            gravity_body_frame,
             linvel,
-            gyro,
+            linacc,
             joint_angles,
             joint_vel,
-            #info["last_nn_act"],
-            info["tita_controller_output"],
-            #info["last_motor_act"],
-            info["command"],
+            joint_torque_controller_normalized,
+            last_nn_act,
+            command
         ]).astype(np.float32)
 
         if not np.isfinite(observation).all():
@@ -747,7 +788,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
                 return 1.0
         
         def _cost_early_termination(self, done: np.ndarray) -> np.ndarray:
-            # Penalize early termination.
             return done
 
         def _cost_joint_effort_limits(self, joint_torques: np.ndarray) -> np.ndarray:
