@@ -18,6 +18,7 @@ from ml_collections import config_dict
 from collections import deque
 import wm
 import copy
+import torch
 
 try:
     import mujoco
@@ -157,6 +158,7 @@ def default_config() -> config_dict.ConfigDict:
       frame_skip=1,
       observation_state_only=True, # True only for sac
       randomize_on_reset=False,
+      apply_perturbations=False,
       episode_length=1000,
       frame_stack=1,
       action_repeat=1,
@@ -269,6 +271,10 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         
         self.action_scale = self._config.action_scale
         self._reset_noise_scale = self._config.reset_noise_scale
+
+        seed = 42
+        torch.manual_seed(seed) 
+        np.random.seed(seed)
         
         MujocoEnv.__init__(
             self,
@@ -455,6 +461,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "mpc_sol_pc_pos": np.zeros(3),
             "mpc_sol_pc_vel": np.zeros(3),
             "mpc_sol_pc_acc": np.zeros(3),
+            "steps_until_next_pert": 0,
+            "pert_duration_seconds": 0,
+            "pert_duration_steps": 0,
+            "steps_since_last_pert": 0,
+            "pert_steps": 0,
+            "pert_dir": np.array([0.0, 0.0, 1.0]),
+            "pert_mag": 0,
         }
 
         self._init_info = copy.deepcopy(self.info.copy())
@@ -522,12 +535,27 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             d_floor_friction = np.random.uniform(low=-d_floor_friction_offset, high=d_floor_friction_offset, size=3)
             #self.model.geom_friction[self._floor_geom_id, 0:3] *= (1 + d_floor_friction)
         
-        # ----- Reset history -----
+        # ----- Reset history-----
         self.info = copy.deepcopy(self._init_info.copy())
+        
+        # ----- Set perturbation -----
+        time_until_next_pert = np.random.uniform(low=self._config.pert_config.kick_wait_times[0], high=self._config.pert_config.kick_wait_times[1])
+        self.info["steps_until_next_pert"] = np.round(time_until_next_pert / self.dt ).astype(int)
 
+        pert_duration_seconds = np.random.uniform(low=self._config.pert_config.kick_durations[0], high=self._config.pert_config.kick_durations[1])
+        self.info["pert_duration_seconds"] = pert_duration_seconds
+
+        pert_duration_steps = np.round(pert_duration_seconds / self.dt ).astype(int)
+        self.info["pert_duration_steps"] = pert_duration_steps
+        
+        pert_mag = np.random.uniform(low=self._config.pert_config.velocity_kick[0], high=self._config.pert_config.velocity_kick[1])
+        self.info["pert_mag"] = pert_mag
+
+        # ----- Set state -----
         self.set_state(qpos, qvel)
         mujoco.mj_forward(self.model, self.data)
 
+        # ----- Initialize controller -----
         self._tita_controller_init()
 
         self.history_obs.clear()
@@ -539,6 +567,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
     def step(self, action):
         """Execute one step of the environment."""
         #print(f"Step frame: {self.n_frame}")
+        if self._config.apply_perturbations == True:
+            self._maybe_apply_perturbation()
+
         self.frame_threshold = 1
         tita_controller_torque, mpc_solution = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
         scaled_action = action*self._config.action_scale
@@ -677,8 +708,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         if len(feet_touching) < target_num_feet:
             feet_air = True
 
-    
-        return False #feet_air or base_collision or fall
+        return self._has_nan() or fall 
+        #return False #feet_air or base_collision or fall
 
     def _has_nan(self) -> bool:
         return self.info['has_nan'] == True
@@ -914,6 +945,54 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         return total_reward, reward_info
     
+    def _maybe_apply_perturbation(self):
+        def gen_dir() -> np.ndarray:
+            angle = np.random.uniform(low=0.0, high=np.pi * 2)
+            dir_force = np.array([np.cos(angle), np.sin(angle), 0.0])
+            return  dir_force
+
+        def apply_pert():
+            t = self.info["pert_steps"] * self.dt
+            u_t = np.sin(np.pi * t / self.info["pert_duration_seconds"])
+            # kg * m/s * 1/s = m/s^2 = kg * m/s^2 (N).
+            max_force = 170.0
+            force = max_force * u_t
+
+            # Lateral force vector, total latera magnitude:
+            #   150 N: gentle push
+            #   190 N: noticeable
+            #   200 N: hard, bring to NaN
+            # Front-back force vector, total longitudinal magnitude:
+            #   200 N: gentle push, FEASIBLE
+            # Top-down force vector, total vertical magnitude:
+            #   10000 N: light 
+            #   11000 N: gentle
+            #   15000 N: noticeable 
+            #   20000 N: moderate
+            #   50000 N: pretty strong
+            #print(self.info["pert_dir"], force)
+            self.data.xfrc_applied[self._torso_body_id, :3] = force * self.info["pert_dir"]
+
+            if self.info["pert_steps"] >= self.info["pert_duration_steps"]:
+                self.info["steps_since_last_pert"]  = 0
+
+            self.info["pert_steps"] += 1
+
+        def wait():
+            self.info["steps_since_last_pert"] += 1
+            self.data.xfrc_applied[self._torso_body_id, :3] = 0.0
+
+            if self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"]:
+                self.info['pert_steps'] = 0
+                
+            if self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"]:
+                self.info["pert_dir"] = gen_dir()
+
+        if self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"]:
+            apply_pert()
+        else:
+            wait()
+
 def make_tita_env(
     render_mode: Optional[str] = None,
     **kwargs
