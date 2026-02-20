@@ -192,11 +192,12 @@ def default_config() -> config_dict.ConfigDict:
               reward_tracking_lin_vel=1, 
               reward_tracking_ang_vel=0.5,
               reward_tracking_height=1,
-              cost_lin_vel_z=-1e-2,
-              cost_ang_vel_xy=-1e-4,
+              cost_lin_vel_z=-0,
+              cost_ang_vel_xy=-0.001,
               #cost_joint_motion=-0.2,
               #cost_joint_torques=-0.00001,
               cost_action_rate=-0.001, 
+              cost_action_rate_second_order=-0.0001,
 
               # Custom rewards
               reward_com_projection=0,
@@ -298,9 +299,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self.action_scale = self._config.action_scale
         self._reset_noise_scale = self._config.reset_noise_scale
 
-        seed = 42
-        torch.manual_seed(seed) 
-        np.random.seed(seed)
+        #seed = 42
+        #torch.manual_seed(seed) 
+        #np.random.seed(seed)
 
         self.task_to_execute = kwargs.pop("task_to_execute")
         
@@ -319,15 +320,15 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         # mapping from task index to desired command
         map_task_list = [
-            {"v": 0.0,       "omega": 0.0,         "vz": 0.0},       # stand still
-            {"v": v_max,     "omega": 0.0,         "vz": 0.0},       # forward
-            #{"v": -v_max,    "omega": 0.0,         "vz": 0.0},       # backward
-            #{"v": 0.0,       "omega": omega_max,   "vz": 0.0},       # turn on place
-            #{"v": v_max,     "omega": omega_max,   "vz": 0.0},       # turn right
-            #{"v": v_max,     "omega": -omega_max,  "vz": 0.0},       # turn left
-            #{"v": 0.0,       "omega": 0.0,         "vz": -vz_max},   # crouch 
-            #{"v": v_max,     "omega": 0.0,         "vz": -vz_max},   # crouch forward
-            #{"v": -v_max,    "omega": 0.0,         "vz": vz_max},    # crouch backward
+            {"v": 0.0,       "omega": 0.0,         "vz": 0.0,        "terrain":"floor"},       # stand still
+            {"v": v_max,     "omega": 0.0,         "vz": 0.0,        "terrain":"floor"},       # forward
+            #{"v": -v_max,    "omega": 0.0,         "vz": 0.0,         "terrain":"floor"},       # backward
+            #{"v": 0.0,       "omega": omega_max,   "vz": 0.0,         "terrain":"floor"},       # turn on place
+            #{"v": v_max,     "omega": omega_max,   "vz": 0.0,         "terrain":"floor"},       # turn right
+            #{"v": v_max,     "omega": -omega_max,  "vz": 0.0,         "terrain":"floor"},       # turn left
+            #{"v": 0.0,       "omega": 0.0,         "vz": -vz_max,     "terrain":"floor"},   # crouch 
+            #{"v": v_max,     "omega": 0.0,         "vz": -vz_max,     "terrain":"floor"},   # crouch forward
+            #{"v": -v_max,    "omega": 0.0,         "vz": vz_max,      "terrain":"floor"},    # crouch backward
         ]
 
         self.map_task = {i: task for i, task in enumerate(map_task_list)}
@@ -354,6 +355,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     def get_config(self) -> config_dict.ConfigDict:
         return self._config
+
+    def get_num_tasks(self) -> int:
+        return len(list(self.map_task.keys()))
 
     def get_obs_info(self) -> Any:
         obs_slices = {}
@@ -416,7 +420,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         return pos, vel, acc
 
     def compute_tita_controller_torque(self, data: mujoco.MjData) -> np.ndarray:
-        robot_state = wm.robot_state_from_mujoco(self.model, data)
+        robot_state = wm.robot_state_from_mujoco(self.model._address, self.data._address)
         result_update = self._walking_manager.update(robot_state, np.array([0.0, 0.0, self._config.reward_config.base_height_target]) )
         torque = result_update.cmd
         mpc_solution = result_update.solution
@@ -449,7 +453,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
     # =========== Environment methods ===========
     
     def _tita_controller_init(self) -> None:
-        robot_state = wm.robot_state_from_mujoco(self.model, self.data)
+        robot_state = wm.robot_state_from_mujoco(self.model._address, self.data._address)
         armatures = {}
         for i in range(self.model.njnt):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
@@ -470,7 +474,12 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._walking_planner = wm.WalkingPlanner(v_des, omega_des, vz_des, z_min, z_max)
 
         #command0 = self._get_current_planner_command(self.n_frame)
-        command0 = np.array([v_des, omega_des, vz_des])
+        command0 = {
+            "v_des": v_des,
+            "omega_des": omega_des,
+            "vz_des": vz_des
+        }
+
         res_init = self._walking_manager.init(robot_state, armatures, self._walking_planner)
 
         self._walking_planner = self._walking_manager.get_walking_planner()
@@ -567,7 +576,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         # info used to be propagated
         self.info = {
-            "command": np.array( [command0[0], command0[1], command0[2]] ),
+            "command": command0,
             "pinocchio_state":{
                 "p_com": res_init.pinocchio_info.p_com,
                 "v_com": res_init.pinocchio_info.v_com,
@@ -716,6 +725,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "left_contact": res_init.pinocchio_info.left_contact,
         }
 
+        self.info["command"] = command0
+
         self.history_obs.clear()
         self.history_act.clear()
 
@@ -852,7 +863,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         linvel = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINVEL_SENSOR)
         linacc = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINACC_SENSOR)
         angvel = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_ANGVEL_SENSOR)
-        command = info["command"]
+        command = np.array([info["command"]['v_des'], info["command"]['omega_des'], info["command"]['vz_des']]).reshape(3,)
 
         joint_angles = qpos[7:]
         joint_vel = qvel[6:]
@@ -909,7 +920,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "command" : command,
 
             #"delta_mpc_sol_com_pos" : mpc_sol_com_pos,
-            "delta_mpc_sol_com_vel" : mpc_sol_com_vel, # - linvel,
+            "mpc_sol_com_vel" : mpc_sol_com_vel, # - linvel,
             #"mpc_sol_com_acc" : mpc_sol_com_acc,
             #"mpc_sol_pl_pos" : mpc_sol_pl_pos,
             "mpc_sol_pl_vel" : mpc_sol_pl_vel,
@@ -1005,8 +1016,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             commands: np.ndarray,
             local_vel: np.ndarray,
         ) -> np.ndarray:
-            track_x_command = self.info["command"][0]
-            track_y_command = self.info["command"][1]  # y vel is 0
+            track_x_command = self.info["command"]['v_des']
+            track_y_command = 0.0  # y vel is 0
             lin_vel_error = np.square(track_x_command - local_vel[0]) + np.square(track_y_command - local_vel[1])
             r_precision = np.exp(-lin_vel_error / (0.25**2))
             return r_precision 
@@ -1017,7 +1028,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             ang_vel: np.ndarray,
         ) -> np.ndarray:
             # Tracking of angular velocity commands (yaw).
-            track_omega_command = self.info["command"][2]
+            track_omega_command = self.info["command"]['omega_des']
             ang_vel_error = np.square(track_omega_command - ang_vel[2])
             r_precision = np.exp(-ang_vel_error / (0.25**2))
             
@@ -1025,6 +1036,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         
         def _reward_tracking_height(self, body_height: np.ndarray) -> np.ndarray:
             current_height = self.info["pinocchio_state"]["p_com"][2]
+            #print(f"frame: {self.n_frame}, current height: {current_height}")
             target_height = 0.4 # self.info["mpc_sol_com_pos"][2]
             error = target_height - current_height
             r_precision = np.exp(-np.square(error) / (0.02**2))  
@@ -1086,15 +1098,16 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
             return r_precision - r_penalty
 
-        def _reward_tracking_acc_mpc(self) -> np.ndarray:
+        def _reward_tracking_acc_mpc(selFf) -> np.ndarray:
             com_acc_error = np.array(self.info["mpc_sol_com_acc"]) - self.data.qacc[0:3]
             r_precision =  np.exp(-np.sum(np.abs(com_acc_error)) / (self._config.reward_config.tracking_sigma**2))
             r_penalty = np.sum(np.abs(com_acc_error))
 
             return r_precision - r_penalty
 
-        def _cost_lin_vel_z(self, global_linvel: np.ndarray, vz: float) -> np.ndarray:
+        def _cost_lin_vel_z(self, global_linvel: np.ndarray) -> np.ndarray:
             # Penalize z axis base linear velocity.*
+            vz = self.info["command"]["vz_des"]
             lin_vel_z_error = abs(global_linvel[2] - vz )
             r_penalty = np.square(lin_vel_z_error)
             return r_penalty
@@ -1112,10 +1125,22 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             # Penalize torques: L2 and L1 norms.
             return np.sqrt(np.sum(np.square(torques))) + np.sum(np.abs(torques))
 
-        def _cost_action_rate(self, act: np.ndarray, prev_act: np.ndarray) -> np.ndarray:
+        def _cost_action_rate(self, act: np.ndarray) -> np.ndarray:
+
+            prev_act = info["prev_nn_act"]
             delta_act = (act - prev_act) * self._config.action_scale
+
             r_penalty = np.sum(np.square(delta_act))
-            return r_penalty
+            return r_penalty if self.n_frame > 0 else 0.0
+        
+        def _cost_action_rate_second_order(self, act: np.ndarray) -> np.ndarray:
+
+            prev_act = info["prev_nn_act"]
+            prev_prev_act = info["prev_prev_nn_act"]
+
+            term = (act - 2*prev_act + prev_prev_act) * self._config.action_scale
+            r_penalty = np.sum(np.square(term))
+            return r_penalty if self.n_frame > 1 else 0.0
         
         def _cost_collision(self, data: mujoco.MjData) -> np.ndarray:
             # Penalize collisions of feet with the torso.
@@ -1299,13 +1324,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "reward_tracking_lin_vel": _reward_tracking_lin_vel(self, info["command"], self.get_local_linvel(data)),
             "reward_tracking_ang_vel": _reward_tracking_ang_vel( self, info["command"], self.get_gyro(data) ),
             "reward_tracking_height": _reward_tracking_height(self, data.subtree_com[0, 2].copy()),
-            #"cost_lin_vel_z": _cost_lin_vel_z(self, self.get_global_linvel(data), info["command"][2]),
-            #"cost_ang_vel_xy": _cost_ang_vel_xy(self, self.get_global_angvel(data)),
+            "cost_lin_vel_z": _cost_lin_vel_z(self, self.get_global_linvel(data)),
+            "cost_ang_vel_xy": _cost_ang_vel_xy(self, self.get_global_angvel(data)),
             #"cost_joint_motion": _cost_joint_motion(self, data.qvel[6:], data.qacc[6:]),
             #"cost_joint_torques": _cost_joint_torques(self, data.actuator_force),
             "cost_action_nn": _cost_action_nn(self, action),
-            "cost_action_rate": _cost_action_rate(self, action, info["prev_nn_act"]),
-
+            "cost_action_rate": _cost_action_rate(self, action),
+            "cost_action_rate_second_order": _cost_action_rate_second_order(self, action),
             # Other reward
             #"reward_com_projection": _reward_com_projection(self, data),
             #"cost_vel_feet": _cost_vel_feet(self, info["command"], data),
