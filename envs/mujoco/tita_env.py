@@ -5,6 +5,7 @@
 
 import sys
 import time
+#sys.path.insert(0, '/home/ubuntu/Desktop/repo_rl/Residual_Learning_TITA/TITA_MJ/compiled')
 sys.path.insert(0, '/home/ubuntu/Desktop/repo_rl/TITA-dynamic-obstacle-avoidance/TITA_MJ/compiled')
 
 import numpy as np
@@ -163,11 +164,10 @@ def default_config() -> config_dict.ConfigDict:
       #sim_dt=0.004,
       use_controller = True,
       frame_skip=1,
-      observation_state_only=True, # True only for sac
       randomize_on_reset=False,
       frame_stack=1,
       action_repeat=1,
-      action_scale=10.0,
+      action_scale=5.0,
       soft_joint_pos_limit_factor=0.95,
       min_height=0.33,
       max_height=0.49,
@@ -193,22 +193,21 @@ def default_config() -> config_dict.ConfigDict:
               reward_tracking_ang_vel=0.5,
               reward_tracking_height=1,
               cost_lin_vel_z=-0,
-              cost_ang_vel_xy=-0.001,
+              cost_ang_vel_xy=-0.01,
               #cost_joint_motion=-0.2,
               #cost_joint_torques=-0.00001,
-              cost_action_rate=-0.001, 
-              cost_action_rate_second_order=-0.0001,
+
+              cost_action_nn=-0.0005,
+              cost_action_rate=-0.005, # aumentare
+              cost_action_rate_second_order=-0.0000,
 
               # Custom rewards
-              reward_com_projection=0,
-              cost_vel_feet=-0,
-              cost_contact_forces_simple=-0,
-
-              cost_action_nn=-0.005,
-              cost_orientation=-3.0,
-              cost_early_termination=-10,
-              has_nan=-0,
-              reward_is_alive=0,
+              cost_total_torque=-0.0001,
+              cost_total_energy=-0.0001,
+              cost_total_torque_smoother=0.0,
+              cost_orientation=-5.0,
+              cost_early_termination=-100,
+              cost_joint_pos_home = -0.1,
 
               #cost_com_projection=-1,
               #cost_feet_height=-1,
@@ -228,20 +227,30 @@ def default_config() -> config_dict.ConfigDict:
           ),
           tracking_sigma=0.25,  
           base_height_target=0.4,
+          home_config = [0.0, 0.48, -0.98, 0.0, 0.0, 0.48, -0.98, 0.0],
       ),
       pert_config=config_dict.create(
           enable=True,
-          max_force=100.0,
+          #max_force=80.0,
+          max_force_x=120.0,
+          max_force_y=120.0,
+          max_force_z=0.0,
           velocity_kick=[0.0, 3.0],  # range for random sampling
           kick_durations=[0.05, 0.2],
           kick_wait_times=[1.0, 3.0],
           # Fixed-frame mode: when True, `fixed_wait_steps` and `fixed_duration_steps`
           # (expressed in simulation steps/frames) override the sampled seconds.
           fixed_perturbation=True,
-          first_perturb = 500,
-          fixed_wait_steps=500,
+          first_perturb = 100,
+          fixed_wait_steps=200,
           fixed_duration_steps=200,
-          max_perturbations=2,
+          perturbation_directions={
+                "0": np.array([1, 0, 0]),   # forward
+                "1": np.array([-1, 0, 0]),  # backward
+                "2": np.array([0, 1, 0]),   # left
+                "3": np.array([0, -1, 0]),  # right
+          },
+          max_perturbations=0,
       ),
       # Command on cartesian space velocities: vx, wz
       command_config=config_dict.create( 
@@ -287,7 +296,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         """
         self._config = config
         self._consts = consts
-        
+
         utils.EzPickle.__init__(
             self,
             xml_file,
@@ -314,21 +323,26 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             **kwargs,
         )
 
+        bounds = self.model.actuator_ctrlrange.copy().astype(np.float32)
+        keep_idx = [0,1,2,4,5,6]  
+        low, high = bounds[keep_idx].T
+        self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
         v_max = abs(self._config.command_config.v_max)
         omega_max = abs(self._config.command_config.omega_max)
         vz_max = abs(self._config.command_config.vz_max)
 
         # mapping from task index to desired command
         map_task_list = [
-            {"v": 0.0,       "omega": 0.0,         "vz": 0.0,        "terrain":"floor"},       # stand still
-            {"v": v_max,     "omega": 0.0,         "vz": 0.0,        "terrain":"floor"},       # forward
-            #{"v": -v_max,    "omega": 0.0,         "vz": 0.0,         "terrain":"floor"},       # backward
-            #{"v": 0.0,       "omega": omega_max,   "vz": 0.0,         "terrain":"floor"},       # turn on place
-            #{"v": v_max,     "omega": omega_max,   "vz": 0.0,         "terrain":"floor"},       # turn right
-            #{"v": v_max,     "omega": -omega_max,  "vz": 0.0,         "terrain":"floor"},       # turn left
-            #{"v": 0.0,       "omega": 0.0,         "vz": -vz_max,     "terrain":"floor"},   # crouch 
-            #{"v": v_max,     "omega": 0.0,         "vz": -vz_max,     "terrain":"floor"},   # crouch forward
-            #{"v": -v_max,    "omega": 0.0,         "vz": vz_max,      "terrain":"floor"},    # crouch backward
+            #{"v": 0.0,       "omega": 0.0,         "vz": 0.0, },       # stand still
+            {"v": v_max,     "omega": 0.0,         "vz": 0.0, },       # forward
+            #{"v": -v_max,    "omega": 0.0,         "vz": 0.0, },       # backward
+            #{"v": 0.0,       "omega": omega_max,   "vz": 0.0, },       # turn on place
+            #{"v": v_max,     "omega": omega_max,   "vz": 0.0, },       # turn right
+            #{"v": v_max,     "omega": -omega_max,  "vz": 0.0, },       # turn left
+            #{"v": 0.0,       "omega": 0.0,         "vz": -vz_max, },   # crouch 
+            #{"v": v_max,     "omega": 0.0,         "vz": -vz_max, },   # crouch forward
+            #{"v": -v_max,    "omega": 0.0,         "vz": vz_max, },    # crouch backward
         ]
 
         self.map_task = {i: task for i, task in enumerate(map_task_list)}
@@ -336,6 +350,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             task["v"]     = np.clip(task["v"], -v_max, v_max)
             task["omega"] = np.clip(task["omega"], -omega_max, omega_max)
             task["vz"]    = np.clip(task["vz"], -vz_max, vz_max)
+
+            task.setdefault("jump_info", {"perform_jump_routine": False, "h_jump": 0.15, "start_jump_at": 100})
+            task.setdefault("terrain", "floor")
         
         self.n_frame = 0
         np.set_printoptions(precision=3, suppress=True)
@@ -345,6 +362,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         #print(f"Environment DT: {self.dt}")
         #print(f"Command Frequency: {1/self.dt} Hz")
 
+        self.check_scales_sign()
         self._post_init()
         #print(self.model.opt.timestep ) # 0.002
         #self.model.opt.timestep = self._config.sim_dt
@@ -352,6 +370,15 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self.reset_model()
 
     # =========== Sensor readings ===========
+
+    def check_scales_sign(self):
+        for k, v in self._config.reward_config.scales.items():
+            if k.startswith("reward_") and v < 0:
+                raise ValueError(f"Reward with negative scale: {k}, {v}")
+            elif k.startswith("cost_") and v > 0:
+                raise ValueError(f"Cost with positive scale: {k}, {v}")
+            elif not (k.startswith("reward_") or k.startswith("cost_")):
+                raise ValueError(f"Invalid reward/cost name: {k}, {v}. Should start with 'reward_' or 'cost_'")
 
     def get_config(self) -> config_dict.ConfigDict:
         return self._config
@@ -421,17 +448,25 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     def compute_tita_controller_torque(self, data: mujoco.MjData) -> np.ndarray:
         robot_state = wm.robot_state_from_mujoco(self.model._address, self.data._address)
-        result_update = self._walking_manager.update(robot_state, np.array([0.0, 0.0, self._config.reward_config.base_height_target]) )
-        torque = result_update.cmd
+        result_update = self._walking_manager.update(robot_state )
+        torque = result_update.torque
+        joint_acc = result_update.acc
         mpc_solution = result_update.solution
         pinocchio_state = result_update.pinocchio_info
 
         torque_sorted = []
+        joint_acc_sorted = []
         for joint_name in self._actuated_joint_names:
             val = torque[joint_name]
             torque_sorted.append(val)
             
-        return np.array(torque_sorted), mpc_solution, pinocchio_state
+            if joint_name in joint_acc:
+                val_acc = joint_acc[joint_name]
+            else:
+                val_acc = -999.0
+            joint_acc_sorted.append(val_acc)
+
+        return np.array(torque_sorted), np.array(joint_acc_sorted), mpc_solution, pinocchio_state
     
     def _quat_mul(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Multiplies two quaternions.
@@ -464,14 +499,24 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         chosen_task = self.task_to_execute % len(self.map_task)
 
+        dt = 0.002
         v_des = self.map_task[chosen_task]["v"]
         omega_des = self.map_task[chosen_task]["omega"]
         vz_des = self.map_task[chosen_task]["vz"]
+        z0 = self._config.reward_config.base_height_target
         z_min = 0.25
         z_max = 0.49
 
         self._walking_manager = wm.WalkingManager()
-        self._walking_planner = wm.WalkingPlanner(v_des, omega_des, vz_des, z_min, z_max)
+
+        try:
+            self._walking_planner = wm.WalkingPlanner(dt, v_des, omega_des, vz_des, z0, z_min, z_max)
+        except Exception:
+            try:
+                self._walking_planner = wm.WalkingPlanner(v_des, omega_des, vz_des, z0, z_min, z_max)
+            except Exception:
+                raise RuntimeError("Failed to initialize the walking planner with the given parameters.")
+
 
         #command0 = self._get_current_planner_command(self.n_frame)
         command0 = {
@@ -480,8 +525,18 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "vz_des": vz_des
         }
 
-        res_init = self._walking_manager.init(robot_state, armatures, self._walking_planner)
+        perform_jump_routine = self.map_task[chosen_task]["jump_info"]["perform_jump_routine"]
+        h_jump = self.map_task[chosen_task]["jump_info"]["h_jump"]
+        start_jump_at = self.map_task[chosen_task]["jump_info"]["start_jump_at"]
 
+        try:
+            res_init = self._walking_manager.init(robot_state, armatures, self._walking_planner, perform_jump_routine, h_jump, start_jump_at)
+        except Exception:
+            try:
+                res_init = self._walking_manager.init(robot_state, armatures, self._walking_planner)
+            except Exception:
+                raise RuntimeError("Failed to initialize the walking manager with the given robot state and planner.")
+            
         self._walking_planner = self._walking_manager.get_walking_planner()
         self.info_planner = self._walking_planner.get_variables()
 
@@ -591,6 +646,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "prev_prev_nn_act": np.zeros(self.model.nu),
             "prev_prev_motor_act": np.zeros(self.model.nu),
             "tita_controller_output" : np.zeros(self.model.nu),
+            "total_applied_torque" : np.zeros(self.model.nu),
             "mpc_sol_com_pos" : np.zeros(3),
             "mpc_sol_com_vel" : np.zeros(3),
             "mpc_sol_com_acc" : np.zeros(3),
@@ -610,10 +666,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "pert_duration_steps": 0,
             "steps_since_last_pert": 0,
             "pert_steps": 0,
-            "pert_dir": np.array([0.0, 0.0, -1.0]),
+            "pert_dir": np.array([0.0, 0.0, 0.0]),
             "pert_mag": 0,
             "n_perturbations_applied": 0,
             "perturbing": False,
+            'lin_vel_xyz_error': np.zeros(3),
+            'omega_vel_error': np.zeros(3),
+            'gravity_xy_error': np.zeros(2),
         }
 
         self._init_info = copy.deepcopy(self.info.copy())
@@ -651,32 +710,32 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
             # Center of mass randomization: +U(-0.05, 0.05)
             d_com_offset = 0.05
-            d_com = np.random.uniform(low=-d_com_offset, high=d_com_offset, size=3)
+            d_com = self.np_random.uniform(low=-d_com_offset, high=d_com_offset, size=3)
             #self.model.body_ipos[self._torso_body_id] += d_com
 
             # Mass: torso mass randomization: +U(-1, 1)
             d_torso_mass_offset = 1
-            d_torso_mass = np.random.uniform(low=-d_torso_mass_offset, high=d_torso_mass_offset)
+            d_torso_mass = self.np_random.uniform(low=-d_torso_mass_offset, high=d_torso_mass_offset)
             self.model.body_mass[self._torso_body_id] += d_torso_mass
 
             # Mass: link mass randomization: *U(-0.1, 0.1)
             d_link_mass_percentage = 0.1
-            d_link_mass = np.random.uniform(low=-d_link_mass_percentage, high=d_link_mass_percentage, size=(self.model.nbody-1))
+            d_link_mass = self.np_random.uniform(low=-d_link_mass_percentage, high=d_link_mass_percentage, size=(self.model.nbody-1))
             self.model.body_mass[1:] *= (1 + d_link_mass)
 
             # Mass: armature randomization: +U(-0.05, 0.05)
             d_armature_offset = 0.05
-            d_armature = np.random.uniform(low=-d_armature_offset, high=d_armature_offset, size=(self.model.nv-6))
+            d_armature = self.np_random.uniform(low=-d_armature_offset, high=d_armature_offset, size=(self.model.nv-6))
             #self.model.dof_armature[6:] += d_armature
 
             # Joint: frictionloss randomization: +U(-0.1, 0.1)
             d_frictionloss_offset = 0.1
-            d_frictionloss = np.random.uniform(low=-d_frictionloss_offset, high=d_frictionloss_offset, size=(self.model.nv - 6))
+            d_frictionloss = self.np_random.uniform(low=-d_frictionloss_offset, high=d_frictionloss_offset, size=(self.model.nv - 6))
             #self.model.dof_frictionloss[6:] *= (1 + d_frictionloss)
 
             # Friction: floor friction randomization: +U(-0.15, 0.15)
             d_floor_friction_offset = 0.15
-            d_floor_friction = np.random.uniform(low=-d_floor_friction_offset, high=d_floor_friction_offset, size=3)
+            d_floor_friction = self.np_random.uniform(low=-d_floor_friction_offset, high=d_floor_friction_offset, size=3)
             #self.model.geom_friction[self._floor_geom_id, 0:3] *= (1 + d_floor_friction)
         
         # ----- Reset history-----
@@ -685,7 +744,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         # ----- Set perturbation -----
         def get_random_value(config_param):
             if isinstance(config_param, (list, np.ndarray, tuple)):
-                return np.random.uniform(low=config_param[0], high=config_param[1])
+                return self.np_random.uniform(low=config_param[0], high=config_param[1])
             return config_param
 
         time_until_next_pert = get_random_value(self._config.pert_config.kick_wait_times)
@@ -736,22 +795,45 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
     def step(self, action):
         """Execute one step of the environment."""
         #print(f"-----------\nframe: {self.n_frame}")
+        #if self.n_frame == 0:
+        #    self.reset_model()
+
         if self._config.pert_config.enable == True:
             #print(f"{self.n_frame}, time since last pert: {self.info['steps_since_last_pert'] * self.dt:.3f} s, steps until next pert: {self.info['steps_until_next_pert']}, pert dur steps: {self.info['pert_duration_steps']}, pert dur s: {self.info['pert_duration_seconds']:.3f} s")
             self._maybe_apply_perturbation()
 
-        tita_controller_torque, mpc_solution, pinocchio_state = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
-        scaled_action = action*self._config.action_scale
-        motor_targets = tita_controller_torque + scaled_action #if self.n_frame >= self.frame_threshold else tita_controller_torque
+        tita_controller_torque, joint_acc, mpc_solution, pinocchio_state = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
         
+        if action.shape != tita_controller_torque.shape:
+            action = np.insert(action, 3,0.0)
+            action = np.insert(action, 7,0.0)
+        scaled_action = action * self._config.action_scale
+
+        motor_targets = tita_controller_torque + scaled_action #if self.n_frame >= self.frame_threshold else tita_controller_torque
+    
+        #if norm_delta  >= 30.0 and self.n_frame > 1:
+        #    tita_controller_torque = self.info["tita_controller_output"]
+        #    motor_targets = tita_controller_torque + scaled_action
+
         out_of_bound_torque_wbc = any(abs(x) >= self.model.actuator_forcerange[i][1] for i, x in enumerate(tita_controller_torque))
         if np.isnan(motor_targets).any() or out_of_bound_torque_wbc:
             self.info["has_nan"] += 1
-            motor_targets = self.info["tita_controller_output"] + scaled_action
             tita_controller_torque = self.info["tita_controller_output"]
+            motor_targets = tita_controller_torque + scaled_action
+            
+            #print("OUT OF BOUNDS TORQUE FROM WBC!!! Using last valid torque. Count:", self.info["has_nan"])
         else:
             self.info["has_nan"] = 0
 
+        delta = tita_controller_torque - self.info['tita_controller_output']
+        delta_max = 5.0
+        need_clip = np.any( np.abs(delta) > delta_max )
+
+        if need_clip and self.n_frame > 10:
+            delta_clipped = np.clip(delta, -delta_max, delta_max)
+            
+            tita_controller_torque = self.info["tita_controller_output"]
+            motor_targets = tita_controller_torque + delta_clipped + scaled_action
 
         self.do_simulation(motor_targets, self._config.frame_skip)
 
@@ -759,6 +841,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         # Store info
         self.info["current_nn_act"] = scaled_action
         self.info["tita_controller_output"] = tita_controller_torque
+        self.info["total_applied_torque"] = motor_targets
         self.info["pinocchio_state"] = {
             "p_com": pinocchio_state.p_com,
             "v_com": pinocchio_state.v_com,
@@ -813,7 +896,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         #print(f"\tang_vel: {self.get_gyro(self.data)}, norm: {np.linalg.norm(self.get_gyro(self.data))} ")
 
         self.dbg = 0
-        reward, reward_info = self._get_rew(action=action, scaled_action=scaled_action, data=self.data, info=self.info)
+        reward, reward_info = self._get_rew(motor_torque=motor_targets, action=action, scaled_action=scaled_action, data=self.data, info=self.info)
         terminated = self._is_terminated(motor_targets, self.data)
         info_reward = {
             **reward_info,
@@ -907,6 +990,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         mpc_sol_omega = np.array(self.info["mpc_sol_omega"]).reshape(1,)
         mpc_sol_alpha = np.array(self.info["mpc_sol_alpha"]).reshape(1,)
         joint_torque_controller_normalized = info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1])
+        total_applied_torque = info["total_applied_torque"] / abs(self.model.actuator_forcerange[:, 1])
         prev_nn_act = info["prev_nn_act"]
         
         self.obs_dict = {
@@ -935,7 +1019,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"mpc_sol_alpha" : np.array(mpc_sol_alpha).reshape(1,),
 
             #"joint_torque_controller_normalized" : info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1]),
-            "prev_nn_act" : prev_nn_act,
+            "prev_nn_act" : prev_nn_act
+            #"total_applied_torque" : total_applied_torque,
         }
 
         observation = np.concatenate([v for v in self.obs_dict.values()]).astype(np.float32)
@@ -1003,7 +1088,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         return float((self.info['has_nan'] > 0))
         return (self.info['has_nan'] > 0)*self.info['has_nan']
 
-    def _get_rew(self, 
+    def _get_rew(self,
+                motor_torque: np.ndarray,
                 action: np.ndarray,
                 scaled_action: np.ndarray,
                 data: mujoco.MjData,
@@ -1018,8 +1104,16 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         ) -> np.ndarray:
             track_x_command = self.info["command"]['v_des']
             track_y_command = 0.0  # y vel is 0
-            lin_vel_error = np.square(track_x_command - local_vel[0]) + np.square(track_y_command - local_vel[1])
+            track_z_command = self.info["command"]['vz_des']
+
+            error_x = track_x_command - local_vel[0]
+            error_y = track_y_command - local_vel[1]
+            error_z = track_z_command - local_vel[2]
+            lin_vel_error = np.square(error_x) + np.square(error_y)
             r_precision = np.exp(-lin_vel_error / (0.25**2))
+            
+            self.info['lin_vel_xyz_error'] = np.array([error_x, error_y, error_z])
+
             return r_precision 
 
         def _reward_tracking_ang_vel(
@@ -1031,13 +1125,15 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             track_omega_command = self.info["command"]['omega_des']
             ang_vel_error = np.square(track_omega_command - ang_vel[2])
             r_precision = np.exp(-ang_vel_error / (0.25**2))
-            
+
+            self.info['omega_vel_error'] = ang_vel_error
+
             return r_precision 
         
         def _reward_tracking_height(self, body_height: np.ndarray) -> np.ndarray:
             current_height = self.info["pinocchio_state"]["p_com"][2]
             #print(f"frame: {self.n_frame}, current height: {current_height}")
-            target_height = 0.4 # self.info["mpc_sol_com_pos"][2]
+            target_height = self._config.reward_config.base_height_target
             error = target_height - current_height
             r_precision = np.exp(-np.square(error) / (0.02**2))  
 
@@ -1180,6 +1276,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             gravity_vector = self.get_gravity(self.data)
             error = gravity_vector[0:2]
             r_penalty = np.sum( np.square(  error ) )
+
+            self.info['gravity_xy_error'] = error
             return r_penalty
         
         def _cost_com_projection(self, data: mujoco.MjData) -> np.ndarray:
@@ -1256,6 +1354,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             # Penalize energy consumption.
             return np.sum(np.abs(qvel) * np.abs(qfrc_actuator))
 
+        def _cost_total_energy(self, motor_torque: np.ndarray, qvel: np.ndarray ) -> np.ndarray:
+            return np.sum(np.abs(qvel) * np.abs(motor_torque))
+        
+        def _cost_total_torque(self, motor_torque: np.ndarray) -> np.ndarray:
+            r_penalty = np.sum(np.square(motor_torque))
+            return r_penalty
+
         def _cost_action_nn(self, action: np.ndarray) -> np.ndarray:
             r_penalty = np.sum(np.square(action*self._config.action_scale))
             return r_penalty
@@ -1289,6 +1394,16 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             out_of_limits = -np.clip(qpos_reduced - self._soft_lowers, None, 0.0)
             out_of_limits += np.clip(qpos_reduced - self._soft_uppers, 0.0, None)
             return np.sum(out_of_limits)
+
+        def _cost_joint_pos_home(self) -> np.ndarray:
+            home_configuration = np.array( self._config.reward_config.home_config )
+            current_configuration = np.array(self.data.qpos[7:])
+
+            delta_config = home_configuration - current_configuration 
+            delta_reduced = np.delete( delta_config, self._consts.TITA_WHEEL_INDICES)
+            r_penalty = np.sum( np.abs( delta_reduced ) )
+            
+            return r_penalty
 
         def _cost_touch_grund(self, data: mujoco.MjData) -> np.ndarray:
             base_collision = False
@@ -1336,12 +1451,15 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"cost_vel_feet": _cost_vel_feet(self, info["command"], data),
             #"cost_contact_forces_simple": _cost_contact_forces_simple(self),
 
+            "cost_total_torque" : _cost_total_torque(self, motor_torque),
+            "cost_total_energy" : _cost_total_energy(self, motor_torque, data.qvel[6:]),
             "cost_orientation": _cost_orientation(self),
-            "reward_is_alive": _reward_is_alive(self, self._is_terminated(data.actuator_force, data)),
+            #"reward_is_alive": _reward_is_alive(self, self._is_terminated(data.actuator_force, data)),
             "cost_early_termination": _cost_early_termination(self, self._is_terminated(data.actuator_force, data)),
             #"cost_feet_height": _cost_feet_height(self, data),
             #"cost_com_projection": _cost_com_projection(self, data),
             #"cost_contact_forces": _cost_contact_forces(self, data),
+            "cost_joint_pos_home": _cost_joint_pos_home(self),
             #"has_nan": self._has_nan(),
 
             #"cost_height": _cost_height(self, data.qpos[2]),
@@ -1353,7 +1471,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"reward_tracking_mpc_com_vel": _reward_tracking_vel_mpc(self),
             #"reward_tracking_mpc_com_acc": _reward_tracking_acc_mpc(self),
             #"reward_tracking_mpc_feet_pos": _reward_tracking_feet_pos_mpc(self),
-            #"cost_energy": _cost_energy(self, data.qvel[6:], data.qacc[6:]),
             #"cost_dof_pos_limits": _cost_joint_pos_limits(self, data.qpos[7:]),
             #"cost_joint_effort_limits": _cost_joint_effort_limits(self, data.actuator_force),
             #"collision": _cost_collision(self, data),
@@ -1362,6 +1479,10 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         reward_info = {
             k: v * self._config.reward_config.scales[k] for k, v in reward.items()
         }
+
+        #self.info["reward_raw"] = {
+        #    'raw_' + k: v for k, v in reward.items()
+        #}
 
         #if self.n_frame % 100 == 0:
         #    print({k: f"{v:.3f}" for k, v in reward_info.items()})
@@ -1396,32 +1517,26 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
     
     def _maybe_apply_perturbation(self):
         def gen_dir() -> np.ndarray:
-            angle = np.random.uniform(low=0.0, high=np.pi * 2)
-            dir_force = np.array([np.cos(angle), np.sin(angle), 0.0])
-            return  dir_force
+            #angle = self.np_random.uniform(low=0.0, high=np.pi * 2)
+            #dir_force = np.array([np.cos(angle), np.sin(angle), 0.0])
+            perturbation_directions = self._config.pert_config.perturbation_directions
+            key = "0" #self.np_random.choice(list(perturbation_directions.keys()))
+            return perturbation_directions[key]
+
+            #return  dir_force
 
         def apply_pert():
             t = self.info["pert_steps"] * self.dt
             u_t = np.sin(np.pi * t / self.info["pert_duration_seconds"])
-            # kg * m/s * 1/s = m/s^2 = kg * m/s^2 (N).
-            max_force = self._config.pert_config.max_force
+
+            max_force_x = abs(self._config.pert_config.max_force_x)
+            max_force_y = abs(self._config.pert_config.max_force_y)
+            max_force_z = abs(self._config.pert_config.max_force_z)
+            max_force = np.array([max_force_x, max_force_y, max_force_z ])
+
             force = max_force * u_t
-
-            # Lateral force vector, total latera magnitude:
-            #   150 N: gentle push
-            #   190 N: noticeable
-            #   200 N: hard, bring to NaN
-            # Front-back force vector, total longitudinal magnitude:
-            #   200 N: gentle push, FEASIBLE
-            # Top-down force vector, total vertical magnitude:
-            #   10000 N: light 
-            #   11000 N: gentle
-            #   15000 N: noticeable 
-            #   20000 N: moderate
-            #   50000 N: pretty strong
-            #print(self.info["pert_dir"], force)
             self.data.xfrc_applied[self._torso_body_id, :3] = force * self.info["pert_dir"]
-
+           
             if self.info["pert_steps"] >= self.info["pert_duration_steps"]:
                 self.info["steps_since_last_pert"]  = 0
                 self.info["n_perturbations_applied"] += 1
@@ -1432,18 +1547,22 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         def wait():
             self.info["steps_since_last_pert"] += 1
             self.data.xfrc_applied[self._torso_body_id, :3] = 0.0
+            self.info["perturb"] = np.zeros(3)
 
             if self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"]:
                 self.info['pert_steps'] = 0
-                
-            if self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"]:
-                self.info["pert_dir"] = gen_dir()
 
-        if self._config.pert_config.first_perturb <= self.n_frame and self.info["steps_since_last_pert"] >= self.info["steps_until_next_pert"] and self.info["n_perturbations_applied"] < self._config.pert_config.max_perturbations:
+        if (self.n_frame >= self._config.pert_config.first_perturb 
+            and self.info["steps_since_last_pert"] >= self._config.pert_config.fixed_wait_steps
+            and self.info["n_perturbations_applied"] < self._config.pert_config.max_perturbations
+            ):
+            if self.info['perturbing'] == False:
+                self.info["pert_dir"] = gen_dir()
+                self.info["pert_steps"] = 0
+
             self.info["perturbing"] = True
             apply_pert()
         else:
-            self.info["perturb"] = np.zeros(3)
             self.info["perturbing"] = False
             wait()
             
