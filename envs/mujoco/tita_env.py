@@ -165,7 +165,7 @@ def default_config() -> config_dict.ConfigDict:
       use_controller = True,
       frame_skip=1,
       randomize_on_reset=False,
-      frame_stack=1,
+      frame_stack=3,
       action_repeat=1,
       action_scale=5.0,
       soft_joint_pos_limit_factor=0.95,
@@ -191,39 +191,29 @@ def default_config() -> config_dict.ConfigDict:
               #reward_tracking_orientation=1.0,
               reward_tracking_lin_vel=1, 
               reward_tracking_ang_vel=0.5,
-              reward_tracking_height=1,
-              cost_lin_vel_z=-0,
-              cost_ang_vel_xy=-0.01,
+              reward_tracking_height=0.1,
+              reward_wheel_com_speed=0.0,
+              cost_lin_vel_z=-0.01,
+              cost_ang_vel_xy=-0.005,
+              cost_joint_velocity=-0.00001,
               #cost_joint_motion=-0.2,
               #cost_joint_torques=-0.00001,
 
-              cost_action_nn=-0.0005,
+              cost_action_nn=-0.0001,
               cost_action_rate=-0.005, # aumentare
               cost_action_rate_second_order=-0.0000,
+              cost_com_projection=-0,
+              cost_feet_slip=-0.1,
+              cost_leg_base_angle=-0.1,
+              cost_delta_com_feet_velocity=-0.0000,
 
               # Custom rewards
-              cost_total_torque=-0.0001,
-              cost_total_energy=-0.0001,
+              cost_total_torque=-0.00000,
+              cost_total_energy=-0.0000,
               cost_total_torque_smoother=0.0,
-              cost_orientation=-5.0,
-              cost_early_termination=-100,
-              cost_joint_pos_home = -0.1,
-
-              #cost_com_projection=-1,
-              #cost_feet_height=-1,
-              #cost_contact_forces=-0.000004,
-              #reward_pose=0.0,
-              #cost_stand_still=-0.01
-              #reward_tracking_mpc_com_pos=0,
-              #reward_tracking_mpc_com_vel=0.5,
-              #reward_tracking_mpc_com_acc=0.1,
-              #reward_tracking_mpc_feet_pos=0,
-              #cost_touch_grund=-10.0,
-              #cost_feet_air=-100.0,
-              #cost_energy=-0.0000001,
-              #collision=0.0,
-              #cost_dof_pos_limits=-0.1,
-              #cost_joint_effort_limits=-0.0,
+              cost_orientation=-1.0,
+              cost_early_termination=-10,
+              cost_joint_pos_home = -0.0,
           ),
           tracking_sigma=0.25,  
           base_height_target=0.4,
@@ -232,7 +222,7 @@ def default_config() -> config_dict.ConfigDict:
       pert_config=config_dict.create(
           enable=True,
           #max_force=80.0,
-          max_force_x=120.0,
+          max_force_x=200.0,
           max_force_y=120.0,
           max_force_z=0.0,
           velocity_kick=[0.0, 3.0],  # range for random sampling
@@ -254,7 +244,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       # Command on cartesian space velocities: vx, wz
       command_config=config_dict.create( 
-          v_max = 0.5, # max linear velocity
+          v_max = 1.0, # max linear velocity
           omega_max = 0.3, # max angular velocity
           vz_max = 0.1, # max vertical velocity
 
@@ -297,6 +287,14 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._config = config
         self._consts = consts
 
+        #xml_list = [
+        #    tita_world.xml"
+        #]
+        #xml_map = {i: task for i, map in enumerate(xml_list)}
+        #xml_file_id = kwargs.pop("xml_to_load")
+        #head, tail = os.path.split(xml_file)
+        #xml_file = os.path.join( head, xml_map[xml_file_id]  )
+
         utils.EzPickle.__init__(
             self,
             xml_file,
@@ -326,7 +324,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         bounds = self.model.actuator_ctrlrange.copy().astype(np.float32)
         keep_idx = [0,1,2,4,5,6]  
         low, high = bounds[keep_idx].T
-        self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        #self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         v_max = abs(self._config.command_config.v_max)
         omega_max = abs(self._config.command_config.omega_max)
@@ -335,7 +333,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         # mapping from task index to desired command
         map_task_list = [
             #{"v": 0.0,       "omega": 0.0,         "vz": 0.0, },       # stand still
-            {"v": v_max,     "omega": 0.0,         "vz": 0.0, },       # forward
+            {"v": 1.0,     "omega": 0.0,         "vz": 0.0, },       # forward
             #{"v": -v_max,    "omega": 0.0,         "vz": 0.0, },       # backward
             #{"v": 0.0,       "omega": omega_max,   "vz": 0.0, },       # turn on place
             #{"v": v_max,     "omega": omega_max,   "vz": 0.0, },       # turn right
@@ -386,6 +384,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
     def get_num_tasks(self) -> int:
         return len(list(self.map_task.keys()))
 
+    def get_num_token(self) -> int:
+        return self.n_token
+
     def get_obs_info(self) -> Any:
         obs_slices = {}
         start_idx = 0
@@ -433,9 +434,26 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
     def get_gyro(self, data: mujoco.MjData) -> np.ndarray:
         return self.get_sensor_data(self.model, data, self._consts.LOCAL_ANGVEL_SENSOR)
+
+    def get_imu_data(self, data: mujoco.MjData) -> Dict[str, np.ndarray]:
+
+        local_accel = self.get_sensor_data(self.model, data, self._consts.LOCAL_LINACC_SENSOR)
+        local_gyro = self.get_sensor_data(self.model, data, self._consts.LOCAL_ANGVEL_SENSOR)
+        
+        return local_accel, local_gyro
     
     def get_imu_rotation_matrix_body_to_world(self, data: mujoco.MjData) -> np.ndarray:
         return data.site_xmat[self._imu_site_id].reshape(3,3)
+
+    def get_com_offset(self, data: mujoco.MjData) -> np.ndarray:
+        left_foot_pos = self.get_feet_site_state(self._left_feet_site_id)[0]
+        right_foot_pos = self.get_feet_site_state(self._right_feet_site_id)[0]
+        com_pos = data.subtree_com[0]
+
+        foot_center = (left_foot_pos + right_foot_pos) / 2
+        com_offset = com_pos[0:2] - foot_center[0:2]
+
+        return com_offset
     
     def get_feet_site_state(self, feet_site_id):
         pos = self.data.site_xpos[feet_site_id].copy() 
@@ -621,8 +639,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._cmd_a = np.array(self._config.command_config.a)
         self._cmd_b = np.array(self._config.command_config.b)
 
-        obs_size = 46 #* self._config.frame_stack
-        self.observation_space = Box( low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32 )
+        self.n_token = 1
+        self.obs_size = 54 + self.n_token #* self._config.frame_stack
+        self.observation_space = Box( low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32 )
 
         self.history_obs = deque(maxlen=self._config.frame_stack )
         self.history_act = deque(maxlen=self._config.frame_stack )
@@ -661,6 +680,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "mpc_sol_alpha" : 0.0,
             "mpc_sol_contact_force_left" : np.zeros(3),
             "mpc_sol_contact_force_right" : np.zeros(3),
+            'frames_tilted' : 0,
             "steps_until_next_pert": 0,
             "pert_duration_seconds": 0,
             "pert_duration_steps": 0,
@@ -672,7 +692,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "perturbing": False,
             'lin_vel_xyz_error': np.zeros(3),
             'omega_vel_error': np.zeros(3),
-            'gravity_xy_error': np.zeros(2),
+            'orientation_xy_error': np.zeros(2),
+            'token' : { 'prova': 0.0},
         }
 
         self._init_info = copy.deepcopy(self.info.copy())
@@ -799,7 +820,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         #    self.reset_model()
 
         if self._config.pert_config.enable == True:
-            #print(f"{self.n_frame}, time since last pert: {self.info['steps_since_last_pert'] * self.dt:.3f} s, steps until next pert: {self.info['steps_until_next_pert']}, pert dur steps: {self.info['pert_duration_steps']}, pert dur s: {self.info['pert_duration_seconds']:.3f} s")
             self._maybe_apply_perturbation()
 
         tita_controller_torque, joint_acc, mpc_solution, pinocchio_state = self.compute_tita_controller_torque(self.data) #if self.n_frame >= self.frame_threshold else [0.0]*self.model.nu
@@ -826,14 +846,19 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             self.info["has_nan"] = 0
 
         delta = tita_controller_torque - self.info['tita_controller_output']
-        delta_max = 5.0
+        delta_max = 10.0
         need_clip = np.any( np.abs(delta) > delta_max )
 
         if need_clip and self.n_frame > 10:
             delta_clipped = np.clip(delta, -delta_max, delta_max)
             
             tita_controller_torque = self.info["tita_controller_output"]
-            motor_targets = tita_controller_torque + delta_clipped + scaled_action
+            #motor_targets = tita_controller_torque + delta_clipped + scaled_action
+            motor_targets = tita_controller_torque + scaled_action
+
+            self.info['token']['prova'] = 1
+        else:
+            self.info['token']['prova'] = 0
 
         self.do_simulation(motor_targets, self._config.frame_skip)
 
@@ -872,6 +897,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self.info["mpc_sol_pr_vel"] = list(mpc_solution.pr.vel)
         self.info["mpc_sol_pr_acc"] = list(mpc_solution.pr.acc)
 
+        # Com Offset
+        self.info["com_offset"] = self.get_com_offset(self.data)
+
         # Contact forces
         cf_left = np.array(mpc_solution.contact_force_left)
         cf_right = np.array(mpc_solution.contact_force_right)
@@ -901,7 +929,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         info_reward = {
             **reward_info,
         }
-
         if self.dbg == 1:# and (self.n_frame % 100 == 0 or ( (1 + self.n_frame) % 100 == 0) ):
             print("------------------------------------------")
             print(f"frame: {self.n_frame}, {action}")
@@ -942,6 +969,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         gravity_vector = self.get_gravity(self.data)
         gravity_body_frame = gravity_vector/np.linalg.norm(gravity_vector)
+
+        gravity_from_imu = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINACC_SENSOR)
+        gravity_from_imu_normalized = gravity_from_imu / np.linalg.norm(gravity_from_imu)
 
         linvel = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINVEL_SENSOR)
         linacc = self.get_sensor_data(self.model, self.data, self._consts.LOCAL_LINACC_SENSOR)
@@ -989,13 +1019,19 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         mpc_sol_theta = np.array(self.info["mpc_sol_theta"]).reshape(1,)
         mpc_sol_omega = np.array(self.info["mpc_sol_omega"]).reshape(1,)
         mpc_sol_alpha = np.array(self.info["mpc_sol_alpha"]).reshape(1,)
+
+        com_projection =  self.get_com_offset(self.data)
         joint_torque_controller_normalized = info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1])
         total_applied_torque = info["total_applied_torque"] / abs(self.model.actuator_forcerange[:, 1])
         prev_nn_act = info["prev_nn_act"]
+        token = np.array(  list(info["token"].values())  ).reshape(1,)
+        token = info["token"]
         
         self.obs_dict = {
             "com_height_wrt_ground" : com_height_wrt_ground,
             "gravity_body_frame" : gravity_body_frame,
+            #"gravity_from_imu_normalized" : gravity_from_imu_normalized,
+            #"gravity_from_imu": gravity_from_imu,
             "linvel" : linvel,
             "angvel" : angvel,
             #"linacc" : linacc,
@@ -1017,13 +1053,29 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"mpc_sol_theta" : np.array(mpc_sol_theta).reshape(1,),
             #"mpc_sol_omega" : np.array(mpc_sol_omega).reshape(1,),
             #"mpc_sol_alpha" : np.array(mpc_sol_alpha).reshape(1,),
-
-            #"joint_torque_controller_normalized" : info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1]),
-            "prev_nn_act" : prev_nn_act
+            #"com_prpjection": com_projection,
+            "joint_torque_controller_normalized" : joint_torque_controller_normalized,
+            "prev_nn_act" : prev_nn_act,
             #"total_applied_torque" : total_applied_torque,
+            "token": token,
         }
 
-        observation = np.concatenate([v for v in self.obs_dict.values()]).astype(np.float32)
+        observation_list = []
+        for v in self.obs_dict.values():
+            if isinstance(v, dict):
+                # Prendi i valori del dizionario
+                for val in v.values():
+                    observation_list.append(np.array([val], dtype=np.float32))
+            else:
+                if np.isscalar(v):
+                    observation_list.append(np.array([v], dtype=np.float32))
+                else:
+                    observation_list.append(np.array(v, dtype=np.float32))
+
+        # Concatenazione finale in un array piatto
+        observation = np.concatenate(observation_list)
+
+        #observation = np.concatenate([v for v in self.obs_dict.values()]).astype(np.float32)
 
         if not np.isfinite(observation).all():
             print(f"NaN or Inf in observation, {self.n_frame} ")
@@ -1040,9 +1092,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         fall = imu_zaxis[2] < -0.2
 
         gravity_vector = self.get_gravity(self.data)
-        gravity_threshold = 0.7
-        fall_lateral = abs(gravity_vector[0]) >= gravity_threshold or abs(gravity_vector[1]) >= gravity_threshold
-        
+        gravity_threshold = 0.9
+        if abs(gravity_vector[0]) >= gravity_threshold or abs(gravity_vector[1]) >= gravity_threshold:
+            self.info['frames_tilted'] += 1
+        else:
+            self.info['frames_tiled'] = 0
+        fall_lateral = self.info['frames_tiled'] > 30
+
         # Base hit ground
         base_collision = False
         for i in range(self.data.ncon):
@@ -1077,10 +1133,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         ang_vel_too_fast = np.linalg.norm( self.get_gyro(self.data) ) > 20.0 
 
-        ep_terminated = fall or base_collision or nan_termination or fall_lateral
-        #if ep_terminated:
-        #    print(f"[TERMINATION @ frame {self.n_frame}] fall={fall}, fall_lateral={fall_lateral}, base_collision={base_collision}, has_nan={self.info['has_nan']}/{nan_threshold}")
-
+        ep_terminated = fall or base_collision or fall_lateral
+      
         return ep_terminated
         #return False #fe et_air or base_collision or fall
 
@@ -1102,15 +1156,16 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             commands: np.ndarray,
             local_vel: np.ndarray,
         ) -> np.ndarray:
+
             track_x_command = self.info["command"]['v_des']
-            track_y_command = 0.0  # y vel is 0
+            track_y_command = 0.0
             track_z_command = self.info["command"]['vz_des']
 
             error_x = track_x_command - local_vel[0]
             error_y = track_y_command - local_vel[1]
             error_z = track_z_command - local_vel[2]
             lin_vel_error = np.square(error_x) + np.square(error_y)
-            r_precision = np.exp(-lin_vel_error / (0.25**2))
+            r_precision = np.exp(-lin_vel_error / (0.4**2))
             
             self.info['lin_vel_xyz_error'] = np.array([error_x, error_y, error_z])
 
@@ -1124,7 +1179,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             # Tracking of angular velocity commands (yaw).
             track_omega_command = self.info["command"]['omega_des']
             ang_vel_error = np.square(track_omega_command - ang_vel[2])
-            r_precision = np.exp(-ang_vel_error / (0.25**2))
+            r_precision = np.exp(-ang_vel_error / (0.4**2))
 
             self.info['omega_vel_error'] = ang_vel_error
 
@@ -1132,79 +1187,37 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         
         def _reward_tracking_height(self, body_height: np.ndarray) -> np.ndarray:
             current_height = self.info["pinocchio_state"]["p_com"][2]
-            #print(f"frame: {self.n_frame}, current height: {current_height}")
             target_height = self._config.reward_config.base_height_target
             error = target_height - current_height
-            r_precision = np.exp(-np.square(error) / (0.02**2))  
+            r_precision = np.exp(-np.square(error) / (0.25**2))  
 
             return r_precision
-        
 
-        def _reward_tracking_feet(self) -> np.ndarray:
+        def _reward_wheel_com_speed(self) -> np.ndarray:
 
-            left_pos, left_vel, left_acc = self.get_feet_site_state(self._left_feet_site_id)
-            right_pos, right_vel, right_acc = self.get_feet_site_state(self._right_feet_site_id)
+            left_foot_vel = self.get_feet_site_state(self._left_feet_site_id)[0]
+            right_foot_vel = self.get_feet_site_state(self._right_feet_site_id)[0]
+            com_vel_local = self.get_local_linvel(self.data)
 
-            left_foot_pos_error = np.array(self.info["mpc_sol_pl_pos"]) - left_pos
-            right_foot_pos_error = np.array(self.info["mpc_sol_pr_pos"]) - right_pos
 
-            left_foot_vel_error = np.array(self.info["mpc_sol_pl_vel"]) - left_vel
-            right_foot_vel_error = np.array(self.info["mpc_sol_pr_vel"]) - right_vel
+            left_vel_lin_x = left_foot_vel[:3][0]
+            right_vel_lin_x = right_foot_vel[:3][0]
+            com_vel_lin_x = com_vel_local[0]
 
-            r_precision_vel_l =  np.exp(-np.sum(np.square(left_foot_pos_error)) / (0.25*2))
-            r_precision_vel_r =  np.exp(-np.sum(np.square(right_foot_pos_error)) / (0.25*2))
-            r_precision = r_precision_vel_l + r_precision_vel_r
+            v_support_polygon = (left_vel_lin_x+ right_vel_lin_x) / 2.0
+            error = np.sum( np.square( com_vel_lin_x  - v_support_polygon))
 
-            return r_precision 
+            r_penalty = np.exp( -error / (0.25**2))
 
-        def _cost_vel_feet(self, commands: np.ndarray, data: mujoco.MjData) -> float:
-            left_foot_pos, left_foot_vel, _ = self.get_feet_site_state(self._left_feet_site_id)
-            right_foot_pos, right_foot_vel, _ = self.get_feet_site_state(self._right_feet_site_id)
+            return r_penalty
 
-            vel_l_global = left_foot_vel[:3]
-            vel_r_global = right_foot_vel[:3]
-
-            R_world2body = self.get_imu_rotation_matrix_body_to_world(data).T
-            vel_l_body = R_world2body @ vel_l_global
-            vel_r_body = R_world2body @ vel_r_global
-
-            command_body = np.array([commands[0], 0.0, 0.0])
-
-            left_error = vel_l_body - command_body
-            right_error = vel_r_body - command_body
-
-            slip_error = np.exp(- (np.sum(np.square(left_error)) + np.sum(np.square(right_error))) / (0.2*2) )
-
-            return 1.0 - slip_error
-
-        def _reward_tracking_pos_mpc(self) -> np.ndarray:
-            com_pos_error = np.array(self.info["mpc_sol_com_pos"]) - self.data.subtree_com[0]
-            r_precision =  np.exp(-np.sum(np.square(com_pos_error)) / (0.3*2))
-            r_penalty = np.sum(np.abs(com_pos_error))
-
-            if self.dbg == 1: # and (self.n_frame % 100 == 0 or ( (1 + self.n_frame) % 100 == 0) ):
-                print(f" MPC com pos target: {np.array(self.info['mpc_sol_com_pos'])}, actual: {self.data.subtree_com[0]}, error: {com_pos_error}, r_precision: {r_precision:.3f}, r_penalty: {r_penalty:.3f} ")
-
-            return r_precision - r_penalty
-
-        def _reward_tracking_vel_mpc(self) -> np.ndarray:
-            com_vel_error = np.array(self.info["mpc_sol_com_vel"]) - self.data.qvel[0:3]
-            r_precision =  np.exp(-np.sum(np.square(com_vel_error)) / (self._config.reward_config.tracking_sigma**2))
-            r_penalty = np.sum(np.abs(com_vel_error))
-
-            return r_precision - r_penalty
-
-        def _reward_tracking_acc_mpc(selFf) -> np.ndarray:
-            com_acc_error = np.array(self.info["mpc_sol_com_acc"]) - self.data.qacc[0:3]
-            r_precision =  np.exp(-np.sum(np.abs(com_acc_error)) / (self._config.reward_config.tracking_sigma**2))
-            r_penalty = np.sum(np.abs(com_acc_error))
-
-            return r_precision - r_penalty
-
-        def _cost_lin_vel_z(self, global_linvel: np.ndarray) -> np.ndarray:
+            
+        def _cost_lin_vel_z(self) -> np.ndarray:
             # Penalize z axis base linear velocity.*
+
+            local_lin_vel = self.get_local_linvel(self.data)
             vz = self.info["command"]["vz_des"]
-            lin_vel_z_error = abs(global_linvel[2] - vz )
+            lin_vel_z_error = abs(local_lin_vel[2] - vz )
             r_penalty = np.square(lin_vel_z_error)
             return r_penalty
 
@@ -1212,6 +1225,13 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             ang_vel_error = global_angvel[:2]
             r_penalty = np.sum(np.square(ang_vel_error))
             return r_penalty
+
+        def _cost_joint_velocity(self,) -> np.ndarray:
+            # Penalize joint motion (acceleration and velocity).
+            qvel = self.data.qvel[6:]
+            r_penalty = np.sum( np.square (qvel) )
+            return r_penalty
+
 
         def _cost_joint_motion(self, qvel: np.ndarray, qacc: np.ndarray) -> np.ndarray:
             # Penalize joint motion (acceleration and velocity).
@@ -1238,121 +1258,90 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             r_penalty = np.sum(np.square(term))
             return r_penalty if self.n_frame > 1 else 0.0
         
-        def _cost_collision(self, data: mujoco.MjData) -> np.ndarray:
-            # Penalize collisions of feet with the torso.
-            n_collision = 0
-            for i in range(data.ncon):
-                c = data.contact[i]
-                g1, g2 = c.geom1, c.geom2
-
-                if (g1 in self._feet_geom_id and g2 == self._torso_geom_id) or (g2 in self._feet_geom_id and g1 == self._torso_geom_id) or \
-                    (g1 == self._torso_geom_id and g2 == self._floor_geom_id) or (g2 == self._torso_geom_id and g1 == self._floor_geom_id):
-            
-                    n_collision += 1.0
-            return n_collision
-
-        def _reward_feet_air_time(self, air_time: np.ndarray, first_contact: np.ndarray, commands: np.ndarray ) -> np.ndarray:
-            # Reward air time.
-            cmd_norm = np.linalg.norm(commands)
-            rew_air_time = np.sum((air_time - 0.1) * first_contact)
-            rew_air_time *= cmd_norm > 0.01  # No reward for zero commands.
-            return rew_air_time
-
-        # Other reward
-        def _reward_orientation(
-            self, current_up_vec: np.ndarray, target_up_vec: np.ndarray
-        ) -> np.ndarray:
-            z_distance = np.dot(current_up_vec, target_up_vec)
-            normalized_z_distance = 1.0 - z_distance
-
-            if self.dbg == 1 and (self.n_frame % 100 == 0 or ( (1 + self.n_frame) % 100 == 0) ):
-                print(f"{current_up_vec}, {target_up_vec}, {z_distance:.3f}, {normalized_z_distance:.3f} ")
-
-            return np.exp(-normalized_z_distance / 0.2)
-        
-            #return np.square(normalized_dist)
-        
         def _cost_orientation(self) -> np.ndarray:
-            gravity_vector = self.get_gravity(self.data)
-            error = gravity_vector[0:2]
+
+            #imu_orientation = data.site_xmat[self._imu_site_id].reshape(3,3)
+            #z_world_vector = np.array([0.0, 0.0, 1.0])
+            #current_up = imu_orientation @ z_world_vector
+            #error = current_up[0:2]
+            
+            gravity_vector = self.get_gravity(self.data)  # già normalizzato
+            gravity_body_frame = gravity_vector / np.linalg.norm(gravity_vector)
+            # quando dritto = [0, 0, 1], errore sulle prime due componenti
+            error = gravity_body_frame[0:2]
+
             r_penalty = np.sum( np.square(  error ) )
 
-            self.info['gravity_xy_error'] = error
+            self.info['orientation_xy_error'] = error
             return r_penalty
         
-        def _cost_com_projection(self, data: mujoco.MjData) -> np.ndarray:
+        def _cost_com_projection(self, com_offset: np.ndarray) -> np.ndarray:
             # Penalize COM projection outside the support polygon.
+            r_penalty = np.sum(np.square(com_offset))
+            return r_penalty
+        
+        def _cost_feet_slip(self):
+
+            left_foot_vel= self.get_feet_site_state(self._left_feet_site_id)[1]
+            right_foot_vel = self.get_feet_site_state(self._right_feet_site_id)[1]
+
+            left_vel_lin = left_foot_vel[:3]
+            left_vel_ang = left_foot_vel[3:]
+
+            right_vel_lin = right_foot_vel[:3]
+            right_vel_ang = right_foot_vel[3:]
+
+            r_penalty = np.square(left_vel_lin[1]) + np.square(right_vel_lin[1])
+            return r_penalty 
+        
+        def _cost_leg_base_angle(self) -> np.ndarray:
             left_foot_pos = self.get_feet_site_state(self._left_feet_site_id)[0]
             right_foot_pos = self.get_feet_site_state(self._right_feet_site_id)[0]
+            mean_foot_pos = ( left_foot_pos + right_foot_pos)/2.0
             com_pos = data.subtree_com[0]
 
-            foot_center = (left_foot_pos + right_foot_pos) / 2
-            com_offset = com_pos[0:2] - foot_center[0:2]
+            left_com_offset = com_pos - left_foot_pos
+            right_com_offset = com_pos - right_foot_pos
+            mean_com_offset = com_pos - mean_foot_pos
 
-            #r_precision_com = np.exp(-np.sum(np.linalg.norm(com_offset)) / 0.065)
-            r_precision = np.square(np.linalg.norm(com_offset))
-            return r_precision
+            left_angle = np.arctan2(left_com_offset[0], left_com_offset[1]) - np.pi
+            right_angle = np.arctan2(right_com_offset[0], right_com_offset[1])
+
+            mean_angle = np.arctan2(mean_com_offset[0], mean_com_offset[1])
+            mean_angle = mean_angle % np.pi - np.pi/2 
+
+            left_penalty = np.square(left_angle)
+            right_penalty = np.square(right_angle)
+            mean_penalty = np.square(mean_angle)
+
+            r_penalty = mean_penalty
+
+            return r_penalty
         
-        def _reward_com_projection(self, data: mujoco.MjData) -> np.ndarray:
-            # Reward COM projection inside the support polygon.
-            left_foot_pos = self.get_feet_site_state(self._left_feet_site_id)[0]
-            right_foot_pos = self.get_feet_site_state(self._right_feet_site_id)[0]
-            com_pos = data.subtree_com[0]
+        def _cost_delta_com_feet_velocity(self) -> np.ndarray:
 
-            foot_center = (left_foot_pos + right_foot_pos) / 2
-            com_offset = com_pos[0:2] - foot_center[0:2]
+            left_foot_vel = self.get_feet_site_state(self._left_feet_site_id)[1]
+            right_foot_vel = self.get_feet_site_state(self._right_feet_site_id)[1]
+            com_lin_vel = self.get_local_linvel(self.data)
+            com_ang_vel = self.get_gyro(self.data)
 
-            r_precision_com = np.exp(-np.sum(np.linalg.norm(com_offset)) / 0.065)
-            return r_precision_com
-        
-        def _cost_contact_forces(self, data: mujoco.MjData) -> np.ndarray:
-            contact_force_left = self.info["mpc_sol_contact_force_left"]
-            contact_force_right = self.info["mpc_sol_contact_force_right"]
-            total_contact_force = np.array(contact_force_left) + np.array(contact_force_right)
+            left_lin_vel = left_foot_vel[0:3]
+            left_ang_vel = left_foot_vel[3:]
 
-            max_safe_force = 400
-            r_penalty = np.maximum(np.sum(np.linalg.norm(total_contact_force)) - max_safe_force, 0)
-            return np.square(r_penalty)
-        
-        def _cost_contact_forces_simple(self) -> np.ndarray:
-            contact_force_left = self.info["mpc_sol_contact_force_left"]
-            contact_force_right = self.info["mpc_sol_contact_force_right"]
-            #robot_mass = self.model.body_mass[self.model.body_name2id("base")]
+            right_lin_vel = right_foot_vel[0:3]
+            right_ang_vel = right_foot_vel[3:]
 
-            #print(f"----\n{self.n_frame}, \ncontact_force_left: {contact_force_left}, \ncontact_force_right: {contact_force_right}")
-            #print("Robot mass:", self.robot_mass)
-            #print("gravity:", self.model.opt.gravity)
-            normalize_factor = 1.0 / (self.robot_mass * abs(self.model.opt.gravity[2]))
-            normalized_contact = normalize_factor * ( np.array(contact_force_left) + np.array(contact_force_right)) 
-            
-            error_xy = normalized_contact[0:2]
-            error_z = max(0.0, normalized_contact[2])
-            r_penalty_xy = np.sum( np.square(  error_xy ) )
-            r_penalty_z = np.square( error_z )
+            mean_foot_lin_vel = ( left_lin_vel + right_lin_vel )/2.0
+            mean_foot_ang_vel = ( left_ang_vel + right_ang_vel )/2.0
 
-            r_penalty = r_penalty_z
-            r_clipped = np.clip(r_penalty, a_min=0.0, a_max=3.0)
-            
-            #print("Normalized contact force:", normalized_contact)
-            #print("Contact force error:", error_xy, error_z)
-            #print(r_penalty_xy, r_penalty_z)
+            error_lin = com_lin_vel - mean_foot_lin_vel
+            error_ang = com_ang_vel - mean_foot_ang_vel
 
-            return r_clipped
-        
-        def _cost_feet_height(self, data: mujoco.MjData) -> np.ndarray:
-            left_foot_pos = self.get_feet_site_state(self._left_feet_site_id)[0]
-            right_foot_pos = self.get_feet_site_state(self._right_feet_site_id)[0]
+            r_penalty_lin  = np.sum( np.square(error_lin ))
+            r_penalty_ang  = np.sum( np.square(error_ang ))
+            r_penalty = r_penalty_lin + r_penalty_ang
 
-            wheel_radius = 0.0925
-            left_foot_height_error = np.abs(left_foot_pos[2] - wheel_radius)
-            right_foot_height_error = np.abs(right_foot_pos[2] - wheel_radius)
-
-            return left_foot_height_error + right_foot_height_error
-        
-        # Energy related rewards.
-        def _cost_energy(self, qvel: np.ndarray, qfrc_actuator: np.ndarray) -> np.ndarray:
-            # Penalize energy consumption.
-            return np.sum(np.abs(qvel) * np.abs(qfrc_actuator))
+            return r_penalty
 
         def _cost_total_energy(self, motor_torque: np.ndarray, qvel: np.ndarray ) -> np.ndarray:
             return np.sum(np.abs(qvel) * np.abs(motor_torque))
@@ -1364,10 +1353,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         def _cost_action_nn(self, action: np.ndarray) -> np.ndarray:
             r_penalty = np.sum(np.square(action*self._config.action_scale))
             return r_penalty
-        
-        def _cost_stand_still(self, commands: np.ndarray, action: np.ndarray,) -> np.ndarray:
-            cmd_norm = np.linalg.norm(commands)
-            return np.sum(np.square(action)) * (cmd_norm < 0.01)
         
         def _reward_is_alive(self, ep_terminated: np.ndarray) -> np.ndarray:
             if ep_terminated == True or (self._has_nan() > 0):
@@ -1404,30 +1389,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             r_penalty = np.sum( np.abs( delta_reduced ) )
             
             return r_penalty
-
-        def _cost_touch_grund(self, data: mujoco.MjData) -> np.ndarray:
-            base_collision = False
-            for i in range(self.data.ncon):
-                c = self.data.contact[i]
-                g1, g2 = c.geom1, c.geom2
-
-                if (g1 == self._torso_geom_id and g2 == self._floor_geom_id) or (g2 == self._torso_geom_id and g1 == self._floor_geom_id):
-                    base_collision = True
-                    break
-
-            if base_collision == True:
-                return 1.0
-            else:
-                return 0.0
-            
-        def _cost_feet_distance(self, data: mujoco.MjData) -> np.ndarray:
-            current_left_foot_pos = self.get_feet_site_state(self._left_feet_site_id)[0]
-            current_right_foot_pos = self.get_feet_site_state(self._right_feet_site_id)[0]
-            current_feet_distance = np.linalg.norm(current_left_foot_pos - current_right_foot_pos)
-            feet_distance_error = np.abs(current_feet_distance - self._initial_feet_distance)
-
-            return feet_distance_error
-
+        
         """Compute reward for current step."""
         imu_orientation = data.site_xmat[self._imu_site_id].reshape(3,3)
         z_world_vector = np.array([0.0, 0.0, 1.0])
@@ -1439,8 +1401,11 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "reward_tracking_lin_vel": _reward_tracking_lin_vel(self, info["command"], self.get_local_linvel(data)),
             "reward_tracking_ang_vel": _reward_tracking_ang_vel( self, info["command"], self.get_gyro(data) ),
             "reward_tracking_height": _reward_tracking_height(self, data.subtree_com[0, 2].copy()),
-            "cost_lin_vel_z": _cost_lin_vel_z(self, self.get_global_linvel(data)),
+            "reward_wheel_com_speed": _reward_wheel_com_speed(self),
+
+            "cost_lin_vel_z": _cost_lin_vel_z(self),
             "cost_ang_vel_xy": _cost_ang_vel_xy(self, self.get_global_angvel(data)),
+            "cost_joint_velocity": _cost_joint_velocity(self), 
             #"cost_joint_motion": _cost_joint_motion(self, data.qvel[6:], data.qacc[6:]),
             #"cost_joint_torques": _cost_joint_torques(self, data.actuator_force),
             "cost_action_nn": _cost_action_nn(self, action),
@@ -1450,6 +1415,10 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #"reward_com_projection": _reward_com_projection(self, data),
             #"cost_vel_feet": _cost_vel_feet(self, info["command"], data),
             #"cost_contact_forces_simple": _cost_contact_forces_simple(self),
+            "cost_com_projection": _cost_com_projection(self, self.get_com_offset(data)),
+            "cost_feet_slip": _cost_feet_slip(self),
+            "cost_leg_base_angle": _cost_leg_base_angle(self),
+            "cost_delta_com_feet_velocity": _cost_delta_com_feet_velocity(self),
 
             "cost_total_torque" : _cost_total_torque(self, motor_torque),
             "cost_total_energy" : _cost_total_energy(self, motor_torque, data.qvel[6:]),
@@ -1462,55 +1431,28 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "cost_joint_pos_home": _cost_joint_pos_home(self),
             #"has_nan": self._has_nan(),
 
-            #"cost_height": _cost_height(self, data.qpos[2]),
-            #"reward_orientation": _reward_orientation(self, current_up, z_world_vector),
-            #"reward_vel_com_feet": _reward_vel_com_feet(self, self.get_local_linvel(data) ),
-            #"cost_touch_grund": _cost_touch_grund(self, data),
-            #"cost_stand_still": _cost_stand_still(self, info["command"], action),
-            #"reward_tracking_mpc_com_pos": _reward_tracking_pos_mpc(self),
-            #"reward_tracking_mpc_com_vel": _reward_tracking_vel_mpc(self),
-            #"reward_tracking_mpc_com_acc": _reward_tracking_acc_mpc(self),
-            #"reward_tracking_mpc_feet_pos": _reward_tracking_feet_pos_mpc(self),
-            #"cost_dof_pos_limits": _cost_joint_pos_limits(self, data.qpos[7:]),
-            #"cost_joint_effort_limits": _cost_joint_effort_limits(self, data.actuator_force),
-            #"collision": _cost_collision(self, data),
         }
 
         reward_info = {
             k: v * self._config.reward_config.scales[k] for k, v in reward.items()
         }
 
-        #self.info["reward_raw"] = {
-        #    'raw_' + k: v for k, v in reward.items()
-        #}
+        reward_clip_dict = {
+            'cost_ang_vel' : 3,
+            'cost_leg_base_angle': 2,
+            'cost_orientation': 2,
+            'cost_feet_slip': 1,
+            'cost_ang_vel_xy': 1.5,
+            'cost_joint_velocity': 0.5
+        }
+        
+        for k, clip_val in reward_clip_dict.items():
+            if k in reward_info:
+                clip_val = abs(clip_val)
+                reward_info[k] = np.clip(reward_info[k], a_min=-clip_val, a_max=clip_val)
 
-        #if self.n_frame % 100 == 0:
-        #    print({k: f"{v:.3f}" for k, v in reward_info.items()})
-        #reward_info['cost_action_rate'] = np.clip(reward_info['cost_action_rate'], -10.0, 10.0)
-        #reward_info['cost_orientation'] = np.clip(reward_info['cost_orientation'], -10.0, 10.0)
-
-        '''
-        reward_info = {}
-        for k, v in reward.items():
-            if k.startswith("reward_") and self._config.reward_config.scales[k] >= 0:
-                reward_info[k] = reward.get(k) * self._config.reward_config.scales[k]
-            elif k.startswith("cost_") and  self._config.reward_config.scales[k] <= 0:
-                reward_info[k] = reward.get(k) * self._config.reward_config.scales[k]
-            else:
-                if k.startswith("reward_") and self._config.reward_config.scales[k] <= 0:
-                    raise(f"Reward with negative scale: {k}, {self._config.reward_config.scales[k]}")
-                elif k.startswith("cost_") and  self._config.reward_config.scales[k] >= 0:
-                    raise(f"Cost with positive scale: {k}, {self._config.reward_config.scales[k]}")
-                else:
-                    raise ValueError(f"Unknown reward component: {k}, {v} {self._config.reward_config.scales[k]}")
-                
-        '''
 
         total_reward = np.clip(sum(reward_info.values()), -10000.0, 10000.0) * self._config.reward_config.total_scaling
-        #termination_penalty = 0.0
-        #if self._is_terminated(data.actuator_force):
-        #    termination_penalty = self._config.reward_config.scales["cost_early_termination"]
-        
         total_reward = total_reward #+ termination_penalty
 
         return total_reward, reward_info
