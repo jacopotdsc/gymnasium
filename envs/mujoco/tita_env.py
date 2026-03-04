@@ -158,6 +158,40 @@ def default_consts() -> config_dict.ConfigDict:
 
     )
 
+'''
+# --- Task reward (dominante) ---
+reward_tracking_lin_vel=1.0,   # tracking vx (principale)
+reward_tracking_ang_vel=0.5,   # tracking omega
+reward_tracking_height=0.2,    # mantiene altezza COM
+reward_wheel_com_speed=0.0,
+
+# --- Penalita' di stabilita' ---
+cost_orientation=-1.0,         # no caduta laterale
+cost_leg_base_angle=-0.5,      # angolo gamba-corpo
+cost_ang_vel_xy=-0.1,          # no rollio/beccheggio
+cost_lin_vel_z=-0.1,           # no oscillazioni verticali
+
+# --- Penalita' di regolarita' azione ---
+cost_action_rate=-0.01,        # smoothness azione
+cost_action_rate_second_order=-0.0,
+cost_action_nn=-0.001,         # penalizza azioni grandi
+
+# --- Penalita' fisiche ---
+cost_feet_slip=-0.2,           # no slittamento ruote
+cost_joint_velocity=-0.0001,
+cost_com_projection=-0.0,
+cost_delta_com_feet_velocity=-0.0,
+
+# --- Energia / coppia ---
+cost_total_torque=-0.0,
+cost_total_energy=-0.0,
+cost_total_torque_smoother=0.0,
+
+# --- Terminazione ---
+cost_early_termination=-5.0,
+cost_joint_pos_home=0.0,
+
+'''
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
       #ctrl_dt=0.02,
@@ -167,7 +201,7 @@ def default_config() -> config_dict.ConfigDict:
       randomize_on_reset=False,
       frame_stack=3,
       action_repeat=1,
-      action_scale=5.0,
+      action_scale=10.0,
       soft_joint_pos_limit_factor=0.95,
       min_height=0.33,
       max_height=0.49,
@@ -184,14 +218,14 @@ def default_config() -> config_dict.ConfigDict:
           ),
       ),
       reward_config=config_dict.create(
-          total_scaling=0.002, #0.002,
+          total_scaling=0.1, #0.002, #0.002,
           scales=config_dict.create(
               # Standard robotic-specific shaping reward
               #reward_tracking_pose=1.0,
               #reward_tracking_orientation=1.0,
-              reward_tracking_lin_vel=1, 
+              reward_tracking_lin_vel=1.0, 
               reward_tracking_ang_vel=0.5,
-              reward_tracking_height=0.1,
+              reward_tracking_height=0.5,
               reward_wheel_com_speed=0.0,
               cost_lin_vel_z=-0.01,
               cost_ang_vel_xy=-0.005,
@@ -199,12 +233,13 @@ def default_config() -> config_dict.ConfigDict:
               #cost_joint_motion=-0.2,
               #cost_joint_torques=-0.00001,
 
-              cost_action_nn=-0.0001,
-              cost_action_rate=-0.005, # aumentare
+              cost_action_nn=-0.002,
+              cost_action_rate=-0.002,
               cost_action_rate_second_order=-0.0000,
+              cost_wbc_failed = -0.0,
               cost_com_projection=-0,
               cost_feet_slip=-0.1,
-              cost_leg_base_angle=-0.1,
+              cost_leg_base_angle=-1.0,
               cost_delta_com_feet_velocity=-0.0000,
 
               # Custom rewards
@@ -597,7 +632,12 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         self._feet_site_id = np.array( [self.model.site(name).id for name in self._consts.FEET_SITES])
         
         self._torso_geom_id = self.model.geom("base_link_collision").id
-        self._floor_geom_id = self.model.geom("floor").id
+        # Collect all terrain geom IDs: plane and hfield geoms in the world body (body id = 0)
+        _terrain_types = {mujoco.mjtGeom.mjGEOM_PLANE, mujoco.mjtGeom.mjGEOM_HFIELD}
+        self._floor_geom_ids = np.array([
+            i for i in range(self.model.ngeom)
+            if self.model.geom_bodyid[i] == 0 and self.model.geom_type[i] in _terrain_types
+        ])
         self._feet_geom_id = np.array( [self.model.geom(name).id for name in (self._consts.LEFT_FEET_GEOMS + self._consts.RIGHT_FEET_GEOMS)] )
         
         try:
@@ -638,10 +678,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
 
         self._cmd_a = np.array(self._config.command_config.a)
         self._cmd_b = np.array(self._config.command_config.b)
-
-        self.n_token = 1
-        self.obs_size = 54 + self.n_token #* self._config.frame_stack
-        self.observation_space = Box( low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32 )
 
         self.history_obs = deque(maxlen=self._config.frame_stack )
         self.history_act = deque(maxlen=self._config.frame_stack )
@@ -693,8 +729,12 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             'lin_vel_xyz_error': np.zeros(3),
             'omega_vel_error': np.zeros(3),
             'orientation_xy_error': np.zeros(2),
-            'token' : { 'prova': 0.0},
+            'token' : { 'use_old': 0.0 , 'frames_tilted': 0.0},
         }
+
+        self.n_token = len(list(self.info['token'].keys()))
+        self.obs_size = 54 + self.n_token #* self._config.frame_stack
+        self.observation_space = Box( low=-np.inf, high=np.inf, shape=(self.obs_size,), dtype=np.float32 )
 
         self._init_info = copy.deepcopy(self.info.copy())
     
@@ -856,9 +896,9 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             #motor_targets = tita_controller_torque + delta_clipped + scaled_action
             motor_targets = tita_controller_torque + scaled_action
 
-            self.info['token']['prova'] = 1
+            self.info['token']['use_old'] = 1
         else:
-            self.info['token']['prova'] = 0
+            self.info['token']['use_old'] = 0
 
         self.do_simulation(motor_targets, self._config.frame_skip)
 
@@ -1024,8 +1064,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         joint_torque_controller_normalized = info["tita_controller_output"]  / abs(self.model.actuator_forcerange[:, 1])
         total_applied_torque = info["total_applied_torque"] / abs(self.model.actuator_forcerange[:, 1])
         prev_nn_act = info["prev_nn_act"]
-        token = np.array(  list(info["token"].values())  ).reshape(1,)
-        token = info["token"]
+        #token = np.array(  list(info["token"].values())  ).reshape(-1,)
+        token = self.info["token"]
         
         self.obs_dict = {
             "com_height_wrt_ground" : com_height_wrt_ground,
@@ -1096,8 +1136,14 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         if abs(gravity_vector[0]) >= gravity_threshold or abs(gravity_vector[1]) >= gravity_threshold:
             self.info['frames_tilted'] += 1
         else:
-            self.info['frames_tiled'] = 0
-        fall_lateral = self.info['frames_tiled'] > 30
+            self.info['frames_tilted'] = 0
+        fall_lateral = self.info['frames_tilted'] > 30
+
+
+        if self.info['frames_tilted'] > 0:
+            self.info['token']['frames_tilted'] = 1
+        else:
+            self.info['token']['frames_tilted'] = 0
 
         # Base hit ground
         base_collision = False
@@ -1105,7 +1151,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             c = self.data.contact[i]
             g1, g2 = c.geom1, c.geom2
 
-            if (g1 == self._torso_geom_id and g2 == self._floor_geom_id) or (g2 == self._torso_geom_id and g1 == self._floor_geom_id):
+            if (g1 == self._torso_geom_id and g2 in self._floor_geom_ids) or (g2 == self._torso_geom_id and g1 in self._floor_geom_ids):
                 base_collision = True
                 break
         
@@ -1116,11 +1162,11 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             c = data.contact[i]
             g1, g2 = c.geom1, c.geom2
 
-            if g1 == self._floor_geom_id:
+            if g1 in self._floor_geom_ids:
                 if g2 in self._feet_geom_id:
                     feet_touching.add(g2)
         
-            elif g2 == self._floor_geom_id:
+            elif g2 in self._floor_geom_ids:
                 if g1 in self._feet_geom_id:
                     feet_touching.add(g1)
                     
@@ -1210,7 +1256,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             r_penalty = np.exp( -error / (0.25**2))
 
             return r_penalty
-
             
         def _cost_lin_vel_z(self) -> np.ndarray:
             # Penalize z axis base linear velocity.*
@@ -1231,7 +1276,6 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             qvel = self.data.qvel[6:]
             r_penalty = np.sum( np.square (qvel) )
             return r_penalty
-
 
         def _cost_joint_motion(self, qvel: np.ndarray, qacc: np.ndarray) -> np.ndarray:
             # Penalize joint motion (acceleration and velocity).
@@ -1257,6 +1301,12 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             term = (act - 2*prev_act + prev_prev_act) * self._config.action_scale
             r_penalty = np.sum(np.square(term))
             return r_penalty if self.n_frame > 1 else 0.0
+        
+        def _cost_wbc_failed(self) -> np.ndarray:
+            is_failed = self.info['token']['use_old'] > 0
+
+            r_penalty = 1.0 if is_failed else 0.0
+            return r_penalty
         
         def _cost_orientation(self) -> np.ndarray:
 
@@ -1411,6 +1461,8 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
             "cost_action_nn": _cost_action_nn(self, action),
             "cost_action_rate": _cost_action_rate(self, action),
             "cost_action_rate_second_order": _cost_action_rate_second_order(self, action),
+            "cost_wbc_failed": _cost_wbc_failed(self),
+
             # Other reward
             #"reward_com_projection": _reward_com_projection(self, data),
             #"cost_vel_feet": _cost_vel_feet(self, info["command"], data),
@@ -1449,7 +1501,7 @@ class TitaEnv(MujocoEnv, utils.EzPickle):
         for k, clip_val in reward_clip_dict.items():
             if k in reward_info:
                 clip_val = abs(clip_val)
-                reward_info[k] = np.clip(reward_info[k], a_min=-clip_val, a_max=clip_val)
+                #reward_info[k] = np.clip(reward_info[k], a_min=-clip_val, a_max=clip_val)
 
 
         total_reward = np.clip(sum(reward_info.values()), -10000.0, 10000.0) * self._config.reward_config.total_scaling
